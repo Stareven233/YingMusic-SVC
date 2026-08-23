@@ -1,11 +1,11 @@
+import argparse
 import math
+
 import numpy as np
 import torch
-from torch import nn
-from torch.nn import functional as F
 from munch import Munch
-import json
-import argparse
+from torch.nn import functional as F
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -19,7 +19,7 @@ def str2bool(v):
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
-        super(AttrDict, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.__dict__ = self
 
 
@@ -337,8 +337,9 @@ MATPLOTLIB_FLAG = False
 def plot_spectrogram_to_numpy(spectrogram):
     global MATPLOTLIB_FLAG
     if not MATPLOTLIB_FLAG:
-        import matplotlib
         import logging
+
+        import matplotlib
 
         matplotlib.use("Agg")
         MATPLOTLIB_FLAG = True
@@ -409,20 +410,21 @@ def build_model(args, stage="DiT"):
         raise ValueError(f"Unknown stage: {stage}")
 
     return nets
-import torch
 import os
-from typing import Dict, List, Optional, Tuple
+
+import torch
+
 
 def my_load_checkpoint(
-    model: Dict[str, torch.nn.Module],
+    model: dict[str, torch.nn.Module],
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
     ckpt_path: str,
     *,
     load_only_params: bool = True,
-    ignore_modules: Optional[List[str]] = None,
+    ignore_modules: list[str] | None = None,
     is_distributed: bool = False,
-) -> Tuple[Dict[str, torch.nn.Module],
+) -> tuple[dict[str, torch.nn.Module],
            torch.optim.Optimizer,
            torch.optim.lr_scheduler._LRScheduler,
            int, int]:
@@ -440,7 +442,7 @@ def my_load_checkpoint(
         sd = net_state[key]
         if not is_distributed:
             # 去掉 DDP 前缀
-            sd = {k[len("module."):] if k.startswith("module.") else k: v
+            sd = {k.removeprefix("module."): v
                   for k, v in sd.items()}
         model_state = model[key].state_dict()
         # 只挑选形状匹配的参数

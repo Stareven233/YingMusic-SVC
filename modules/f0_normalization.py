@@ -1,10 +1,10 @@
-import torch
+import os
+from pathlib import Path
+
 import numpy as np
 import pyworld as pw
 import soundfile as sf
-import os
-from pathlib import Path
-from typing import Optional, Tuple, List, Union
+import torch
 
 
 def f0_normalize_and_synthesize(
@@ -141,7 +141,7 @@ def extract_f0_features(
     f0_min: float = 50.0,
     f0_max: float = 1100.0,
     frame_period: float = None
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     仅提取WORLD vocoder特征，不进行合成
     
@@ -229,11 +229,11 @@ def demo_usage():
 
 def demo_save_audio(
     txt_file_path: str = "/user-fs/chenzihao/chengongyu/svc/seed-vc/test/dataset/debug.txt",
-    output_dir: Union[str, Path] = "/user-fs/chenzihao/chengongyu/svc/seed-vc/highfreq_f0_pred/strange/f0normal",
+    output_dir: str | Path = "/user-fs/chenzihao/chengongyu/svc/seed-vc/highfreq_f0_pred/strange/f0normal",
     sample_rate: int = 22050,
     normalize_method: str = "mean_replace",
     max_duration: float = 60.0
-) -> List[str]:
+) -> list[str]:
     """
     从txt文件读取音频路径，进行F0归一化处理并保存
     
@@ -347,10 +347,10 @@ def demo_save_audio(
 
 
 def demo_with_synthetic_audio(
-    output_dir: Union[str, Path] = "output/f0_normalized",
+    output_dir: str | Path = "output/f0_normalized",
     sample_rate: int = 44100,
     normalize_method: str = "mean_replace"
-) -> List[str]:
+) -> list[str]:
     """
     使用合成音频进行演示
     """
@@ -396,12 +396,12 @@ def demo_with_synthetic_audio(
 
 def save_batch_audio(
     audio_batch: torch.Tensor,
-    filenames: List[str],
-    output_dir: Union[str, Path] = "output/f0_normalized",
+    filenames: list[str],
+    output_dir: str | Path = "output/f0_normalized",
     sample_rate: int = 44100,
     audio_format: str = "wav",
     create_dir: bool = True
-) -> List[str]:
+) -> list[str]:
     """
     将batch音频保存到指定文件夹
     

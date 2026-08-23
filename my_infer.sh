@@ -21,8 +21,3 @@ python my_inference.py \
     --fp16 "${fp16}" \
     --accompany "${accompany}" \
     --config "${config}"
-
-
-
-
-

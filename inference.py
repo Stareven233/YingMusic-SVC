@@ -1,0 +1,559 @@
+'''
+YingMusic-SVC inference -- swapped two-stage vocoder pipeline (training-free):
+
+    YingMusic-SVC DiT -> predicted Mel
+      -> [stage 1] Pupu-Vocoder            -> temp.wav (intermediate)
+      -> re-extract Mel (PC-NSF params) + explicit F0 from the source audio
+         (RMVPE, pitch-controllable via --pitch-shift / --f0-scale)
+      -> [stage 2] PC-NSF-HiFiGAN          -> final.wav
+
+The original BigGAN-family (bigvgan) vocoding path has been removed; the
+predicted Mel is no longer fed to the built-in vocoder directly.
+
+Quick start refs:
+https://zread.ai/GiantAILab/YingMusic-SVC/2-quick-start
+https://zread.ai/GiantAILab/YingMusic-SVC/3-model-download-and-setup
+
+uv venv --python=3.10
+./.venv/Scripts/python.exe -c "from modelscope import snapshot_download; snapshot_download('giantailab/YingMusic-SVC', local_dir='./checkpoints')"
+uv pip install torch~=2.4.0 torchaudio~=2.4.0 --index-url https://download.pytorch.org/whl/cu124
+uv pip install -r ./requirements.txt
+
+./.venv/Scripts/python.exe inference.py --source vocal.wav --target timbre.wav
+uv run ./inference.py --source 'D:/Document/ai-sings/テオ/【翻唱】将手（テオ） ／ Omoi【Kotone(天神子兔音)cover】_Vocals_vocals_noreverb.flac' --target 'D:/Code/projects/DDSP-SVC/data/megumin/train/audio/ちいさな冒険者 めぐみん Version - 高橋李依_vocals_noreverb_0007.wav'
+'''
+
+import os
+
+# ---------------------------------------------------------------------------
+# Dependency guard: fail early with an actionable message instead of a raw
+# traceback when the environment is not fully provisioned.
+# ---------------------------------------------------------------------------
+_CORE_DEPS = ["numpy", "torch", "torchaudio", "librosa", "yaml", "soundfile"]
+
+def _check_core_deps():
+    import importlib.util
+    missing = []
+    for mod in _CORE_DEPS:
+        if importlib.util.find_spec(mod) is None:
+            missing.append(mod)
+    if missing:
+        print("=" * 72)
+        print("MISSING PYTHON DEPENDENCIES:", ", ".join(missing))
+        print("Please install them yourself (no automatic downloads), e.g.:")
+        print(f"    uv pip install {' '.join(missing)}")
+        print("Plus the new-vocoder extras: uv pip install julius safetensors")
+        print("=" * 72)
+        raise SystemExit(2)
+
+_check_core_deps()
+
+import argparse
+import time
+import warnings
+
+import numpy as np
+import torch
+import torchaudio
+import yaml
+
+warnings.simplefilter('ignore')
+
+import librosa
+
+from hf_utils import load_custom_model_from_hf
+from mm4 import preprocess_voice_conversion
+from modules.audio import mel_spectrogram
+from modules.commons import *
+from pc_nsf_hifigan import load_pc_nsf_hifigan
+from pupu_vocoder import load_pupu_vocoder
+from Remix.auger import echo_then_reverb_save
+
+# ---------------------------------------------------------------------------
+# Local pretrained assets (see TODO.md). Nothing is downloaded automatically
+# for these; run preflight_check() output tells you what is missing.
+# ---------------------------------------------------------------------------
+LOCAL_RMVPE_PATH = './pretrain/rmvpe/model.pt'
+PUPU_VOCODER_DIR = ('./pretrain/vocoder/Pupu-Vocoder/experiments/pupuvocoder/'
+                    'checkpoint/epoch-0051_step-2553605_loss-62.135194')
+PC_NSF_HIFIGAN_DIR = './pretrain/vocoder/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02'
+
+
+def preflight_check(args):
+    """Verify local weights and python dependencies; report what is missing.
+
+    Per project policy nothing is downloaded automatically -- missing items
+    are listed so the user can provision them manually."""
+    import importlib.util
+
+    ok = True
+
+    print("-" * 72)
+    print("[preflight] checking python dependencies ...")
+    # (numpy/torch/librosa/yaml/soundfile already guarded at import time.)
+    required_deps = {
+        'scipy': 'scipy', 'munch': 'munch', 'einops': 'einops',
+        'transformers': 'transformers',
+        'julius': 'julius', 'beartype': 'beartype',
+        'rotary_embedding_torch': 'rotary_embedding_torch',
+        'ml_collections': 'ml_collections', 'loralib': 'loralib',
+        'accelerate': 'accelerate',
+    }
+    missing_deps = [d for d in required_deps if importlib.util.find_spec(d) is None]
+    if missing_deps:
+        ok = False
+        print(f"  [MISSING] {', '.join(missing_deps)}")
+        print(f"            install manually, e.g.: uv pip install {' '.join(missing_deps)}")
+    else:
+        print("  [OK] all required packages found")
+
+    print("[preflight] checking model weights ...")
+    weight_checks = [
+        ("SVC checkpoint (YingMusic-SVC)", args.checkpoint, True),
+        ("SVC config", args.config, True),
+        ("rmvpe (local)", LOCAL_RMVPE_PATH, False),
+        ("Pupu-Vocoder generator", os.path.join(PUPU_VOCODER_DIR, 'model.safetensors'), True),
+        ("PC-NSF-HiFiGAN config", os.path.join(PC_NSF_HIFIGAN_DIR, 'config.json'), True),
+        ("PC-NSF-HiFiGAN ckpt", os.path.join(PC_NSF_HIFIGAN_DIR, 'model.ckpt'), False),
+    ]
+    for label, path, required in weight_checks:
+        if os.path.isfile(path):
+            print(f"  [OK] {label}: {path}")
+        elif required:
+            ok = False
+            print(f"  [MISSING] {label}: {path}")
+        else:
+            print(f"  [WARN] {label}: {path} not found")
+
+    print("[preflight] NOTE: the following are fetched through HuggingFace on "
+          "first run unless already cached:")
+    print("           - openai/whisper-small            (speech tokenizer)")
+    print("           - funasr/campplus                 (style encoder)")
+    if not os.path.isfile(LOCAL_RMVPE_PATH):
+        print("           - lj1995/VoiceConversionWebUI rmvpe.pt (local copy missing)")
+    print("           Set HF_ENDPOINT=https://hf-mirror.com if needed.")
+    print("-" * 72)
+
+    if not ok:
+        print("Preflight FAILED. Provision the items above yourself "
+              "(no automatic downloads), then re-run.")
+        raise SystemExit(2)
+
+
+def extract_explicit_f0(f0_fn, waves_16k, thred=0.03):
+    """Extract a continuous explicit F0 trajectory with RMVPE.
+
+    Reuses the RMVPE model already loaded for SVC conditioning
+    (modules/rmvpe.py): it runs on 16 kHz audio and yields one F0 value every
+    10 ms (hop 160); unvoiced frames are marked as 0 and are linearly
+    interpolated here so the NSF excitation stays smooth.
+    """
+    f0 = f0_fn(waves_16k, thred=thred)
+    f0 = np.asarray(f0, dtype=np.float64).reshape(-1)
+
+    voiced = f0 > 0
+    if voiced.any():
+        idx = np.arange(f0.size)
+        f0 = np.interp(idx, idx[voiced], f0[voiced])
+    else:
+        # fully unvoiced input: zero F0 makes the NSF source silent
+        f0 = np.zeros_like(f0)
+
+    return f0.astype(np.float32)
+
+
+def resize_f0_to_frames(f0, n_frames):
+    """Linearly resample an F0 curve onto exactly `n_frames` points."""
+    if f0.size == n_frames:
+        return f0
+    x_old = np.linspace(0.0, 1.0, f0.size, endpoint=True)
+    x_new = np.linspace(0.0, 1.0, n_frames, endpoint=True)
+    return np.interp(x_new, x_old, f0).astype(np.float32)
+
+
+def load_models_api(args, device=torch.device("cuda")):
+    dit_checkpoint_path = args.checkpoint
+    print(f'load model from {dit_checkpoint_path}')
+    dit_config_path = args.config
+    print(f'load config from {dit_config_path}')
+
+    # f0 extractor (prefer the local rmvpe weights; fall back to HF hub)
+    from modules.rmvpe import RMVPE
+    if os.path.isfile(LOCAL_RMVPE_PATH):
+        model_path = LOCAL_RMVPE_PATH
+        print(f'load rmvpe from {model_path}')
+    else:
+        model_path = load_custom_model_from_hf("lj1995/VoiceConversionWebUI", "rmvpe.pt", None)
+    f0_extractor = RMVPE(model_path, is_half=False, device=device)
+    f0_fn = f0_extractor.infer_from_audio
+
+    config = yaml.safe_load(open(dit_config_path, "r"))
+    model_params = recursive_munch(config["model_params"])
+    model_params.dit_type = 'DiT'
+    model = build_model(model_params, stage="DiT")
+    sr = config["preprocess_params"]["sr"]
+
+    # Load checkpoints
+    model, _, _, _ = load_checkpoint(
+        model,
+        None,
+        dit_checkpoint_path,
+        load_only_params=True,
+        ignore_modules=[],
+        is_distributed=False,
+    )
+
+    for key in model:
+        model[key].eval()
+        model[key].to(device)
+    model.cfm.estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+
+    # Load additional modules
+    from modules.campplus.DTDNN import CAMPPlus
+
+    campplus_ckpt_path = load_custom_model_from_hf(
+        "funasr/campplus", "campplus_cn_common.bin", config_filename=None
+    )
+
+    campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
+    campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
+    campplus_model.eval()
+    campplus_model.to(device)
+
+    # ------------------------------------------------------------------
+    # NOTE: the original bigvgan ("BigGAN") vocoder block was removed here.
+    # Synthesis now goes through Pupu-Vocoder + PC-NSF-HiFiGAN (see
+    # run_inference); the DiT-predicted Mel is never vocoded by bigvgan.
+    # ------------------------------------------------------------------
+
+    speech_tokenizer_type = model_params.speech_tokenizer.type
+    if speech_tokenizer_type == 'whisper':
+        # whisper
+        from transformers import AutoFeatureExtractor, WhisperModel
+        whisper_name = model_params.speech_tokenizer.name
+
+        whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=torch.float16).to(device)
+        del whisper_model.decoder
+        whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_name)
+
+        def semantic_fn(waves_16k):
+            ori_inputs = whisper_feature_extractor([waves_16k.squeeze(0).cpu().numpy()],
+                                                   return_tensors="pt",
+                                                   return_attention_mask=True)
+            ori_input_features = whisper_model._mask_input_features(
+                ori_inputs.input_features, attention_mask=ori_inputs.attention_mask).to(device)
+            with torch.no_grad():
+                ori_outputs = whisper_model.encoder(
+                    ori_input_features.to(whisper_model.encoder.dtype),
+                    head_mask=None,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+            S_ori = ori_outputs.last_hidden_state.to(torch.float32)
+            S_ori = S_ori[:, :waves_16k.size(-1) // 320 + 1]
+            return S_ori
+    else:
+        raise ValueError(f"Unknown speech tokenizer type: {speech_tokenizer_type}")
+
+    # Generate mel spectrograms (SVC model convention: ln-compressed, fmin=0)
+    mel_fn_args = {
+        "n_fft": config['preprocess_params']['spect_params']['n_fft'],
+        "win_size": config['preprocess_params']['spect_params']['win_length'],
+        "hop_size": config['preprocess_params']['spect_params']['hop_length'],
+        "num_mels": config['preprocess_params']['spect_params']['n_mels'],
+        "sampling_rate": sr,
+        "fmin": config['preprocess_params']['spect_params'].get('fmin', 0),
+        "fmax": None if config['preprocess_params']['spect_params'].get('fmax', "None") == "None" else 8000,
+        "center": False
+    }
+
+    def to_mel(x):
+        return mel_spectrogram(x, **mel_fn_args)
+
+    # ---- swapped-in vocoders ------------------------------------------
+    pupu_vocoder = load_pupu_vocoder(PUPU_VOCODER_DIR, device=device)   # stage 1
+    pcnsf_vocoder = load_pc_nsf_hifigan(PC_NSF_HIFIGAN_DIR, device=device)  # stage 2
+
+    return {
+        "model": model,
+        "semantic_fn": semantic_fn,
+        "f0_fn": f0_fn,
+        "campplus_model": campplus_model,
+        "mel_fn": to_mel,
+        "mel_fn_args": mel_fn_args,
+        "pupu_vocoder": pupu_vocoder,
+        "pcnsf_vocoder": pcnsf_vocoder,
+    }
+
+
+@torch.no_grad()
+def run_inference(args, bundle, device=torch.device("cuda")):
+    """Voice conversion up to the predicted Mel, then the swapped two-stage
+    vocoder synthesis:
+
+      predicted Mel chunks --(concat)--> Pupu-Vocoder --> temp.wav
+      temp.wav --> re-extracted Mel + explicit F0 (pitch-scaled) --> PC-NSF-HiFiGAN --> final.wav
+    """
+    dit_config_path = args.config
+    config = yaml.safe_load(open(dit_config_path, "r"))
+
+    # use_style_residual
+    use_style_residual = config['model_params']['length_regulator'].get('use_style_residual', False)
+
+    model = bundle["model"]
+    semantic_fn = bundle["semantic_fn"]
+    f0_fn = bundle["f0_fn"]
+    campplus_model = bundle["campplus_model"]
+    mel_fn = bundle["mel_fn"]
+    mel_fn_args = bundle["mel_fn_args"]
+    pupu_vocoder = bundle["pupu_vocoder"]
+    pcnsf_vocoder = bundle["pcnsf_vocoder"]
+
+    fp16 = args.fp16
+    sr = mel_fn_args['sampling_rate']
+    f0_condition = args.f0_condition
+    forch_pitch_shift = args.semi_tone_shift
+
+    source = args.source
+    target_name = args.target
+    print(source, target_name)
+    diffusion_steps = args.diffusion_steps
+    length_adjust = args.length_adjust
+    inference_cfg_rate = args.inference_cfg_rate
+    exp_path = os.path.join(args.output, args.expname)
+    source_audio = librosa.load(source, sr=sr)[0]
+    ref_audio = librosa.load(target_name, sr=sr)[0]
+
+    sr = 22050 if not f0_condition else 44100
+    hop_length = 256 if not f0_condition else 512
+    max_context_window = sr // hop_length * 30
+    overlap_frame_len = 16
+
+    # Process audio
+    source_audio = torch.tensor(source_audio).unsqueeze(0).float().to(device)
+    ref_audio = torch.tensor(ref_audio[:sr * 25]).unsqueeze(0).float().to(device)
+
+    time_vc_start = time.time()
+    # Resample
+    converted_waves_16k = torchaudio.functional.resample(source_audio, sr, 16000)
+    # if source audio less than 30 seconds, whisper can handle in one forward
+    if converted_waves_16k.size(-1) <= 16000 * 30:
+        S_alt = semantic_fn(converted_waves_16k)
+    else:
+        overlapping_time = 5  # 5 seconds
+        S_alt_list = []
+        buffer = None
+        traversed_time = 0
+        while traversed_time < converted_waves_16k.size(-1):
+            if buffer is None:
+                chunk = converted_waves_16k[:, traversed_time:traversed_time + 16000 * 30]
+            else:
+                chunk = torch.cat(
+                    [buffer, converted_waves_16k[:, traversed_time:traversed_time + 16000 * (30 - overlapping_time)]],
+                    dim=-1)
+            S_chunk = semantic_fn(chunk)
+            if traversed_time == 0:
+                S_alt_list.append(S_chunk)
+            else:
+                S_alt_list.append(S_chunk[:, 50 * overlapping_time:])
+            buffer = chunk[:, -16000 * overlapping_time:]
+            traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
+        S_alt = torch.cat(S_alt_list, dim=1)
+
+    ori_waves_16k = torchaudio.functional.resample(ref_audio, sr, 16000)
+    S_ori = semantic_fn(ori_waves_16k)
+
+    mel = mel_fn(source_audio.float())
+    mel2 = mel_fn(ref_audio.float())
+
+    target_lengths = torch.LongTensor([int(mel.size(2) * length_adjust)]).to(mel.device)
+    target2_lengths = torch.LongTensor([mel2.size(2)]).to(mel2.device)
+
+    feat2 = torchaudio.compliance.kaldi.fbank(ori_waves_16k,
+                                              num_mel_bins=80,
+                                              dither=0,
+                                              sample_frequency=16000)
+    feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
+    style2 = campplus_model(feat2.unsqueeze(0))
+
+    if f0_condition:
+        F0_ori = f0_fn(ori_waves_16k[0], thred=0.03)
+        F0_alt = f0_fn(converted_waves_16k[0], thred=0.03)
+
+        F0_ori = torch.from_numpy(F0_ori).to(device)[None]
+        F0_alt = torch.from_numpy(F0_alt).to(device)[None]
+
+        voiced_F0_ori = F0_ori[F0_ori > 1]
+        voiced_F0_alt = F0_alt[F0_alt > 1]
+
+        log_f0_alt = torch.log(F0_alt + 1e-5)
+        shifted_log_f0_alt = log_f0_alt.clone()
+        shifted_f0_alt = torch.exp(shifted_log_f0_alt)
+
+        # automatic f0 adjust
+        shifted_f0_alt, pitch_shift = preprocess_voice_conversion(
+            voiced_f0_ori=voiced_F0_ori,
+            voiced_f0_alt=voiced_F0_alt,
+            shifted_f0_alt=shifted_f0_alt,
+            enable_adaptive=True,
+            max_shift_semitones=24,
+            forch_pitch_shift=forch_pitch_shift,
+        )
+        print(f'automatic pitch shift {pitch_shift} semi tones')
+    else:
+        F0_ori = None
+        F0_alt = None
+        shifted_f0_alt = None
+        pitch_shift = 0
+
+    # Length regulation
+    cond, _, codes, commitment_loss, codebook_loss, style_cond = model.length_regulator(S_alt, ylens=target_lengths,
+                                                                                        n_quantizers=3,
+                                                                                        f0=shifted_f0_alt, style=style2, return_style_residual=True)
+    prompt_condition, _, codes, commitment_loss, codebook_loss, style_prompt = model.length_regulator(S_ori,
+                                                                                       ylens=target2_lengths,
+                                                                                       n_quantizers=3,
+                                                                                       f0=F0_ori, style=style2, return_style_residual=True)
+
+    max_source_window = max_context_window - mel2.size(2)
+    # split source condition (cond) into chunks and collect the predicted Mel
+    processed_frames = 0
+    pred_mel_chunks = []
+    while processed_frames < cond.size(1):
+        chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
+        is_last_chunk = processed_frames + max_source_window >= cond.size(1)
+        cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
+        # use_style_residual
+        if use_style_residual:
+            chunk_style_cond = style_cond[:, processed_frames:processed_frames + max_source_window]
+            cat_style_cond = torch.cat([style_prompt, chunk_style_cond], dim=1)
+        else:
+            cat_style_cond = None
+        with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
+            # Voice Conversion (predicts Mel, not wave)
+            vc_target = model.cfm.inference(cat_condition,
+                                            torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
+                                            mel2, style2, None, diffusion_steps,
+                                            inference_cfg_rate=inference_cfg_rate, style_r=cat_style_cond)
+
+            vc_target = vc_target[:, :, mel2.size(-1):]
+
+        # Collect predicted Mel chunks. Every chunk re-generates the previous
+        # `overlap_frame_len` frames, so strip them from subsequent chunks --
+        # concatenation then yields a seamless full-length predicted Mel.
+        if processed_frames == 0:
+            pred_mel_chunks.append(vc_target.float())
+        else:
+            pred_mel_chunks.append(vc_target.float()[:, :, overlap_frame_len:])
+        processed_frames += vc_target.size(2) - overlap_frame_len
+
+    pred_mel = torch.cat(pred_mel_chunks, dim=2)  # (1, num_mels, frames)
+    print(f'predicted Mel: {pred_mel.shape[2]} frames @ {sr} Hz')
+
+    time_vc_end = time.time()
+    print(f"SVC/DiT stage RTF: {(time_vc_end - time_vc_start) / (pred_mel.size(2) * hop_length) * sr}")
+
+    os.makedirs(exp_path, exist_ok=True)
+    src_name = os.path.basename(source).split(".")[0]
+    tgt_name = os.path.basename(target_name).split(".")[0]
+
+    # ==================================================================
+    # Stage 1: Pupu-Vocoder -- predicted Mel -> intermediate WAV
+    # ==================================================================
+    temp_wave = pupu_vocoder.mel_to_wav(pred_mel.cpu())
+    temp_path = os.path.join(exp_path, f'{src_name}_temp.wav')
+    torchaudio.save(temp_path, torch.from_numpy(temp_wave)[None, :].float(), pupu_vocoder.sample_rate)
+    print(f'[stage 1] Pupu-Vocoder wrote {temp_path}')
+
+    # ==================================================================
+    # Stage 2: explicit F0 control + PC-NSF-HiFiGAN -> final WAV
+    # ==================================================================
+    # 2.1 re-extract the Mel from the intermediate audio using the
+    #     PC-NSF-HiFiGAN's own spectrogram parameters (128 bins, hop 512,
+    #     fmin 40, fmax 16000 @ 44.1 kHz)
+    temp_audio, _ = librosa.load(temp_path, sr=pcnsf_vocoder.sample_rate)
+    temp_audio_t = torch.tensor(temp_audio).unsqueeze(0).float().to(device)
+    new_mel = pcnsf_vocoder.wave_to_mel(temp_audio_t)  # (1, num_mels, frames)
+    n_frames = new_mel.shape[2]
+
+    # 2.2 explicit F0 condition extracted from the ORIGINAL input audio via
+    #     the already-loaded RMVPE (16 kHz resample, 10 ms grid), optionally
+    #     pitch-shifted (--pitch-shift semitones / --f0-scale)
+    f0_scale = args.f0_scale * (2.0 ** (args.pitch_shift / 12.0))
+    explicit_f0 = extract_explicit_f0(f0_fn, converted_waves_16k[0])
+    explicit_f0 = resize_f0_to_frames(explicit_f0, n_frames) * f0_scale
+    print(f'[stage 2] explicit F0 scale x{f0_scale:.4f} '
+          f'(pitch shift {args.pitch_shift:+g} st, f0 scale {args.f0_scale:g})')
+
+    # 2.3 final synthesis with the pitch-controllable vocoder
+    final_wave = pcnsf_vocoder.mel_to_wav(new_mel, explicit_f0)
+    final_tensor = torch.clamp(torch.from_numpy(final_wave)[None, :].float(), -1.0, 1.0)
+
+    time_synth_end = time.time()
+    print(f"Overall RTF: {(time_synth_end - time_vc_start) / final_tensor.size(-1) * sr}")
+
+    if hasattr(args, "uuid"):
+        vc_name = f'{src_name}_{tgt_name}_' + args.uuid + '.wav'
+    else:
+        vc_name = f"{tgt_name}_{src_name}_{pitch_shift}_ps{args.pitch_shift:g}.wav"
+    output_path = os.path.join(exp_path, vc_name)
+    torchaudio.save(output_path, final_tensor.cpu(), sr)
+    print(f'[stage 2] PC-NSF-HiFiGAN wrote {output_path}')
+    return output_path
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="YingMusic-SVC inference with Pupu-Vocoder -> PC-NSF-HiFiGAN "
+                    "two-stage synthesis and explicit F0 (pitch) control.")
+    parser.add_argument("--source", type=str, help="Source vocal audio (wav/flac/mp3 ...)")
+    parser.add_argument("--target", type=str, help="Reference audio providing the target timbre")
+    parser.add_argument("--diffusion-steps", type=int, default=30)
+    parser.add_argument("--checkpoint", type=str, default='./checkpoints/YingMusic-SVC-full.pt',
+                        help="Path to the SVC checkpoint file")
+    parser.add_argument("--expname", type=str, default='swap_vocoder')
+    parser.add_argument("--cuda", type=str, default='0')
+    parser.add_argument("--fp16", type=str, default='True')
+    parser.add_argument("--accompany", type=str, default=None,
+                        help="Optional accompaniment track for remixing (echo/reverb)")
+    parser.add_argument("--config", type=str, default='./configs/YingMusic-SVC.yml')
+
+    # --- new: explicit pitch control for the final PC-NSF-HiFiGAN stage ---
+    parser.add_argument("--pitch-shift", type=float, default=0.0, dest='pitch_shift',
+                        help="Pitch shift in semitones applied to the explicit F0 "
+                             "condition of PC-NSF-HiFiGAN (e.g. 2.0 = +2 semitones up)")
+    parser.add_argument("--f0-scale", type=float, default=1.0, dest='f0_scale',
+                        help="Direct multiplicative scale on the explicit F0 "
+                             "(e.g. 1.2 ~= up 3.2 semitones, 0.8 ~= down 3.9 semitones); "
+                             "applied on top of --pitch-shift")
+
+    parser.add_argument("--semi-tone-shift", type=float, default=None, dest='semi_tone_shift',
+                        help="Forced semi-tone shift for the SVC model's internal adaptive "
+                             "F0 alignment; None keeps automatic sandhi")
+    parser.add_argument("--length-adjust", type=float, default=1.0, dest='length_adjust')
+    parser.add_argument("--inference-cfg-rate", type=float, default=0.7, dest='inference_cfg_rate')
+    parser.add_argument("--output", type=str, default='./outputs')
+    parser.add_argument("--skip-check", action='store_true', dest='skip_check',
+                        help="Skip the pre-flight dependency/weight check")
+    args = parser.parse_args()
+
+    args.cuda = torch.device(f"cuda:{args.cuda}")
+    args.fp16 = str2bool(args.fp16)
+    if args.fp16:
+        print('Start fp16 to accelerate inference！')
+
+    args.f0_condition = True
+    if not args.skip_check:
+        preflight_check(args)
+
+    os.makedirs(args.output, exist_ok=True)
+
+    models = load_models_api(args, device=args.cuda)
+    vc = run_inference(args, models, device=args.cuda)
+    if args.accompany:
+        a = os.path.dirname(vc)
+        b = os.path.basename(vc)
+        os.makedirs(os.path.join(a, 'accompany'), exist_ok=True)
+        op = os.path.join(a, 'accompany', b)
+        echo_then_reverb_save(vc, op, args.accompany)
