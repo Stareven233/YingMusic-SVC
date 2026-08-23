@@ -40,7 +40,7 @@ def _check_core_deps():
         print('=' * 72)
         print('MISSING PYTHON DEPENDENCIES:', ', '.join(missing))
         print('Please install them yourself (no automatic downloads), e.g.:')
-        print(f'    uv pip install {' '.join(missing)}')
+        print(f'    uv pip install {" ".join(missing)}')
         print('Plus the new-vocoder extras: uv pip install julius safetensors')
         print('=' * 72)
         raise SystemExit(2)
@@ -78,6 +78,14 @@ from Remix.auger import echo_then_reverb_save
 # ---------------------------------------------------------------------------
 PROJECT_NAME = 'YingMusic'
 DEFAULT_DIFFUSION_STEPS = 30  # 与下方 --diffusion-steps 默认值保持一致
+
+# 声码器计算精度：fp32 保持原始精度；fp16/bf16 通过 autocast 把激活值降到半精度
+# （权重仅 ~50MB，显存大头是随音频长度线性增长的激活值，半精度可再省约一半）
+VOCODER_DTYPES = {
+    'fp32': torch.float32,
+    'bf16': torch.bfloat16,
+    'fp16': torch.float16,
+}
 
 # 从 ckpt 文件名提取训练步数：model-step=10000.ckpt -> 10000
 CKPT_STEP_PATTERN = re.compile(r'step[=_-](\d+)', re.IGNORECASE)
@@ -141,8 +149,8 @@ def preflight_check(args):
     missing_deps = [d for d in required_deps if importlib.util.find_spec(d) is None]
     if missing_deps:
         ok = False
-        print(f'  [MISSING] {', '.join(missing_deps)}')
-        print(f'            install manually, e.g.: uv pip install {' '.join(missing_deps)}')
+        print(f'  [MISSING] {", ".join(missing_deps)}')
+        print(f'            install manually, e.g.: uv pip install {" ".join(missing_deps)}')
     else:
         print('  [OK] all required packages found')
 
@@ -311,8 +319,16 @@ def load_models_api(args, device=torch.device('cuda')):
         return mel_spectrogram(x, **mel_fn_args)
 
     # ---- swapped-in vocoders ------------------------------------------
-    pupu_vocoder = load_pupu_vocoder(PUPU_VOCODER_DIR, device=device)   # stage 1
-    pcnsf_vocoder = load_pc_nsf_hifigan(PC_NSF_HIFIGAN_DIR, device=device)  # stage 2
+    # 分块 + autocast 半精度推理：峰值显存与音频总长解耦，12GB 卡不再爆显存
+    vocoder_dtype = VOCODER_DTYPES[args.vocoder_dtype]
+    print(f'[vocoders] dtype={args.vocoder_dtype}, chunk={args.vocoder_chunk} frames, '
+          f'overlap={args.vocoder_overlap} frames')
+    pupu_vocoder = load_pupu_vocoder(PUPU_VOCODER_DIR, device=device, dtype=vocoder_dtype,
+                                     chunk_frames=args.vocoder_chunk,
+                                     overlap_frames=args.vocoder_overlap)   # stage 1
+    pcnsf_vocoder = load_pc_nsf_hifigan(PC_NSF_HIFIGAN_DIR, device=device, dtype=vocoder_dtype,
+                                        chunk_frames=args.vocoder_chunk,
+                                        overlap_frames=args.vocoder_overlap)  # stage 2
 
     return {
         'model': model,
@@ -497,7 +513,10 @@ def run_inference(args, bundle, device=torch.device('cuda')):
     print(f'predicted Mel: {pred_mel.shape[2]} frames @ {sr} Hz')
 
     time_vc_end = time.time()
-    print(f'SVC/DiT stage RTF: {(time_vc_end - time_vc_start) / (pred_mel.size(2) * hop_length) * sr}')
+    print(f'flow-matching stage RTF: {(time_vc_end - time_vc_start) / (pred_mel.size(2) * hop_length) * sr}')
+
+    # DiT 主干推理结束：把缓存池里的碎片化显存归还驱动，给声码器腾出连续空间
+    torch.cuda.empty_cache()
 
     exp_path = Path(args.output) / args.expname
     exp_path.mkdir(parents=True, exist_ok=True)  # 连同 --output 根目录一并创建
@@ -508,8 +527,7 @@ def run_inference(args, bundle, device=torch.device('cuda')):
     # ==================================================================
     temp_wave = pupu_vocoder.mel_to_wav(pred_mel.cpu())
     temp_path = exp_path / f'{src_stem}_temp.wav'
-    torchaudio.save(str(temp_path), torch.from_numpy(temp_wave)[None, :].float(),
-                    pupu_vocoder.sample_rate)
+    torchaudio.save(str(temp_path), torch.from_numpy(temp_wave)[None, :].float(), pupu_vocoder.sample_rate)
     print(f'[stage 1] Pupu-Vocoder wrote {temp_path}')
 
     # ==================================================================
@@ -527,8 +545,7 @@ def run_inference(args, bundle, device=torch.device('cuda')):
     f0_scale = args.f0_scale * (2.0 ** (args.pitch_shift / 12.0))
     explicit_f0 = extract_explicit_f0(f0_fn, converted_waves_16k[0])
     explicit_f0 = resize_f0_to_frames(explicit_f0, n_frames) * f0_scale
-    print(f'[stage 2] explicit F0 scale x{f0_scale:.4f} '
-          f'(pitch shift {args.pitch_shift:+g} st, f0 scale {args.f0_scale:g})')
+    print(f'[stage 2] explicit F0 scale x{f0_scale:.4f} (pitch shift {args.pitch_shift:+g} st, f0 scale {args.f0_scale:g})')
 
     # 2.3 用音高可控声码器做最终合成
     final_wave = pcnsf_vocoder.mel_to_wav(new_mel, explicit_f0)
@@ -578,6 +595,17 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=str, default='./outputs')
     parser.add_argument('--skip-check', action='store_true', dest='skip_check',
                         help='Skip the pre-flight dependency/weight check')
+
+    # --- 声码器显存优化（分块 + autocast 半精度） ---
+    parser.add_argument('--vocoder-dtype', type=str, default='bf16', dest='vocoder_dtype',
+                        choices=['fp32', 'bf16', 'fp16'],
+                        help='两个声码器的计算精度：fp16/bf16 用 autocast 把激活值降到半精度，'
+                             '显存约减半（权重始终 fp32 驻留）；如听到伪影可退回 fp32')
+    parser.add_argument('--vocoder-chunk', type=int, default=2048, dest='vocoder_chunk',
+                        help='声码器分块推理的 mel 帧数（hop512@44.1kHz 下每帧约 11.6ms，'
+                             '512 帧约 6s 音频；<=0 表示不分块、整段前向）')
+    parser.add_argument('--vocoder-overlap', type=int, default=64, dest='vocoder_overlap',
+                        help='分块间重叠的 mel 帧数（波形交叉淡化拼接区，需大于模型感受野）')
     args = parser.parse_args()
 
     args.cuda = torch.device(f'cuda:{args.cuda}')

@@ -18,16 +18,17 @@ The F0 condition is a per-mel-frame fundamental frequency trajectory in Hz,
 shape (batch, n_frames).
 """
 
+import contextlib
 import json
 import os
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from librosa.filters import mel as librosa_mel_fn
+from torch import nn
 from torch.nn import Conv1d, ConvTranspose1d
-from torch.nn.utils import weight_norm, remove_weight_norm
+from torch.nn.utils import remove_weight_norm, weight_norm
 
 LRELU_SLOPE = 0.1
 
@@ -253,16 +254,20 @@ class Generator(torch.nn.Module):
         sines = torch.sin(2 * np.pi * rad)
         return sines
 
-    def forward(self, x, f0):
+    def forward(self, x, f0, har_source=None):
         """
         x:  (batch, num_mels, frames)  natural-log compressed mel
         f0: (batch, frames)            fundamental frequency in Hz
+        har_source: 可选的预生成源激励，(batch, 1, frames * upp)。分块推理时由外部
+            在全长 F0 上一次性生成后切片传入：fastsinegen 的相位是跨帧全局累积
+            （cumsum）的，逐块重算会丢失相位连续性导致接缝处谐波失真。
         returns: (batch, 1, frames * hop_size)
         """
-        if self.mini_nsf:
-            har_source = self.fastsinegen(f0)
-        else:
-            har_source = self.m_source(f0.unsqueeze(-1), self.upp).transpose(1, 2)
+        if har_source is None:
+            if self.mini_nsf:
+                har_source = self.fastsinegen(f0)
+            else:
+                har_source = self.m_source(f0.unsqueeze(-1), self.upp).transpose(1, 2)
         x = self.conv_pre(x)
         if self.noise_sigma is not None and self.noise_sigma > 0:
             x += self.noise_sigma * torch.randn_like(x)
@@ -344,9 +349,16 @@ def extract_mel_for_pcnsf(y, mel_fn_args):
 
 
 class PCNSFHiFiGAN:
-    """Thin inference wrapper: mel + explicit F0 -> waveform."""
+    """Thin inference wrapper: mel + explicit F0 -> waveform.
 
-    def __init__(self, generator, h, device):
+    显存策略与 pupu_vocoder.PupuVocoderWrapper 一致：分块推理（峰值显存与音频
+    总长解耦）+ autocast 半精度（权重仅 ~50MB，激活值才是大头；不直接
+    ``.half()`` 权重以避免零初始化缓冲区的 dtype 不匹配问题）。差异点：
+    NSF 的源激励含全局相位累积，必须先在全长 F0 上生成一次再按块切片。
+    """
+
+    def __init__(self, generator, h, device, dtype=torch.float32,
+                 chunk_frames=512, overlap_frames=64):
         self.generator = generator
         self.h = h
         self.device = device
@@ -362,6 +374,16 @@ class PCNSFHiFiGAN:
             "fmax": h.fmax,
             "center": False,
         }
+        self.dtype = dtype                # 计算精度（权重保持 fp32，靠 autocast 降激活精度）
+        self.chunk_frames = chunk_frames  # 分块推理的 mel 帧数；<=0 表示整段前向
+        self.overlap_frames = overlap_frames  # 块间重叠帧数（交叉淡化区）
+
+    def _amp_ctx(self):
+        """fp16/bf16 时返回 CUDA autocast 上下文；CPU 上强制回退 fp32。"""
+        if self.device.type == 'cuda' and self.dtype != torch.float32:
+            return torch.autocast('cuda', dtype=self.dtype)
+        return contextlib.nullcontext()
+
 
     @torch.no_grad()
     def wave_to_mel(self, wave, device=None):
@@ -374,19 +396,68 @@ class PCNSFHiFiGAN:
         return extract_mel_for_pcnsf(wave.float(), self.mel_fn_args)
 
     @torch.no_grad()
-    def mel_to_wav(self, mel, f0):
+    def mel_to_wav(self, mel, f0, chunk_frames=None, overlap_frames=None):
         """
         mel: (1, num_mels, frames) natural-log compressed mel (on any device)
         f0:  (frames,) numpy array or tensor of F0 in Hz, aligned to mel frames
         returns: 1-D numpy waveform at self.sample_rate
+
+        chunk_frames / overlap_frames 不传时使用加载时的默认配置；短音频或
+        ``chunk_frames <= 0`` 时整段前向。
         """
         if isinstance(f0, np.ndarray):
             f0 = torch.from_numpy(f0).float()
-        f0 = f0.to(mel.device).reshape(1, -1)
+        mel = mel.float().to(self.device)
+        # 源激励在 fp32 下计算（autocast 会自动按需转换给各卷积层），
+        # 避免 fp16 下相位累积的精度损失
+        f0 = f0.float().to(self.device).reshape(1, -1)
         assert f0.shape[1] == mel.shape[2], (
             f"F0 frames ({f0.shape[1]}) != mel frames ({mel.shape[2]})")
-        wav = self.generator(mel.float(), f0)
-        return wav.squeeze().cpu().numpy()
+
+        chunk_frames = self.chunk_frames if chunk_frames is None else chunk_frames
+        overlap_frames = self.overlap_frames if overlap_frames is None else overlap_frames
+        total_frames = mel.shape[2]
+
+        # 短音频或显式关闭分块：整段一次前向
+        if chunk_frames is None or chunk_frames <= 0 or total_frames <= chunk_frames:
+            with self._amp_ctx():
+                wav = self.generator(mel, f0)
+            return wav.squeeze().float().cpu().numpy()
+
+        g = self.generator
+        upp = g.upp  # 源激励相对 mel 帧的上采样倍率（mini NSF 与常规 NSF 一致）
+        # 谐波源激励一次性全长生成：(1, 1, frames*upp)，几十 MB 级别，开销可忽略；
+        # 保证跨块的绝对相位连续，接缝处才不会出现谐波突变
+        with torch.no_grad():
+            if g.mini_nsf:
+                har_source = g.fastsinegen(f0)
+            else:
+                har_source = g.m_source(f0.unsqueeze(-1), g.upp).transpose(1, 2)
+
+        out = None
+        start = 0
+        while start < total_frames:
+            end = min(start + chunk_frames, total_frames)
+            # 末段剩余不足一个重叠区时并入当前块，避免产生过短末块
+            if 0 < total_frames - end < overlap_frames:
+                end = total_frames
+            with self._amp_ctx():
+                wav = g(mel[:, :, start:end], f0[:, start:end],
+                        har_source=har_source[:, :, start * upp:end * upp])
+            wav = wav.squeeze().float().cpu().numpy()
+            if out is None:
+                out = wav
+            else:
+                # 与上一块尾部做线性交叉淡化（重叠远超感受野，边界不可闻）
+                n = min(out.size, wav.size, overlap_frames * self.hop_length)
+                ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+                out[-n:] = out[-n:] * (1.0 - ramp) + wav[:n] * ramp
+                out = np.concatenate([out, wav[n:]])
+            if end >= total_frames:
+                break
+            # 回退 overlap 帧推进，保证下一块与已拼接区域有共同覆盖且严格前进
+            start = max(end - overlap_frames, start + 1)
+        return out
 
 
 def find_checkpoint_file(vocoder_dir):
@@ -406,7 +477,8 @@ def find_checkpoint_file(vocoder_dir):
         f"No *.ckpt generator checkpoint found in {vocoder_dir}")
 
 
-def load_pc_nsf_hifigan(vocoder_dir, device=torch.device("cuda")):
+def load_pc_nsf_hifigan(vocoder_dir, device=torch.device("cuda"),
+                        dtype=torch.float32, chunk_frames=512, overlap_frames=64):
     """
     Build the PC-NSF-HiFiGAN generator from an openvpi release directory
     (config.json + model.ckpt) and return a PCNSFHiFiGAN wrapper.
@@ -418,11 +490,14 @@ def load_pc_nsf_hifigan(vocoder_dir, device=torch.device("cuda")):
     ckpt_file = find_checkpoint_file(vocoder_dir)
     print(f'[PC-NSF-HiFiGAN] loading generator from {ckpt_file}')
     cp_dict = torch.load(ckpt_file, map_location='cpu')
-    state_dict = cp_dict['generator'] if 'generator' in cp_dict else cp_dict
+    state_dict = cp_dict.get('generator', cp_dict)
     generator = Generator(h)
     generator.load_state_dict(state_dict)
     generator.eval()
     generator.remove_weight_norm()
     del cp_dict
-    generator = generator.to(device)
-    return PCNSFHiFiGAN(generator, h, device)
+    generator = generator.to(device)  # 权重始终以 fp32 驻留，精度切换由 wrapper 的 autocast 负责
+    print(f'[PC-NSF-HiFiGAN] compute dtype={dtype}, chunk={chunk_frames} frames, '
+          f'overlap={overlap_frames} frames')
+    return PCNSFHiFiGAN(generator, h, device, dtype=dtype,
+                        chunk_frames=chunk_frames, overlap_frames=overlap_frames)

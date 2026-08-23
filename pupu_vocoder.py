@@ -20,11 +20,12 @@ config parsing is needed at inference time.
 import contextlib
 import importlib
 import json
-import os
+import math
 import struct
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 PUPO_ROOT = Path(__file__).resolve().parent / "pretrain" / "vocoder" / "Pupu-Vocoder"
@@ -40,7 +41,6 @@ _CONFLICT_TOP_LEVEL = ("modules", "utils", "models", "dataset", "bins")
 @contextlib.contextmanager
 def _isolated_pupu_imports():
     """Temporarily resolve top-level imports against the pupu repo root."""
-    saved_path = list(sys.path)
     saved_modules = {}
     sys.path.insert(0, str(PUPO_ROOT))
     try:
@@ -128,24 +128,89 @@ def load_safetensors(path):
 
 
 class PupuVocoderWrapper:
-    """mel (batch, n_mel, frames) -> waveform numpy array @ 44.1 kHz."""
+    """mel (batch, n_mel, frames) -> waveform numpy array @ 44.1 kHz.
 
-    def __init__(self, generator, cfg, device):
+    显存策略：
+    - 分块推理：Pupu-Vocoder 全部由局部算子构成（Conv1d、零插值 + FIR、
+      snake 激活），没有全局注意力/FFT，块间重叠超过感受野后用波形域
+      线性交叉淡化拼接即可无缝衔接；峰值显存因此只与 chunk 大小相关，
+      与音频总长解耦（这是 12GB 卡上长音频爆显存的根治手段）。
+    - 半精度：权重仅约 13M 参数（~50MB fp32），显存大头是激活值；用
+      autocast 把卷积激活降到 fp16/bf16 可再省约一半。注意不能用
+      ``generator.half()``：源码 ResampleUpsampler 里 ``torch.zeros(...)``
+      未指定 dtype（恒为 fp32），直接半化权重会导致卷积输入 dtype 不匹配；
+      且源码内部已用 ``autocast(enabled=False)`` 保护 FIR 滤波，说明
+      autocast 正是其训练时的混合精度路径，按此方式推理最安全。
+    """
+
+    def __init__(self, generator, cfg, device, dtype=torch.float32,
+                 chunk_frames=512, overlap_frames=64):
         self.generator = generator
         self.cfg = cfg
         self.device = device
+        self.dtype = dtype                # 计算精度（权重保持 fp32，靠 autocast 降激活精度）
+        self.chunk_frames = chunk_frames  # 分块推理的 mel 帧数；<=0 表示整段前向
+        self.overlap_frames = overlap_frames  # 块间重叠帧数（交叉淡化区）
         self.sample_rate = cfg.preprocess.sample_rate
 
+    def _amp_ctx(self):
+        """fp16/bf16 时返回 CUDA autocast 上下文；CPU 上强制回退 fp32。"""
+        if self.device.type == 'cuda' and self.dtype != torch.float32:
+            return torch.autocast('cuda', dtype=self.dtype)
+        return contextlib.nullcontext()
+
     @torch.no_grad()
-    def mel_to_wav(self, mel):
+    def mel_to_wav(self, mel, chunk_frames=None, overlap_frames=None):
         """mel: (1, n_mel, frames) tensor (ln-compressed, HiFiGAN convention).
-        Returns 1-D numpy waveform."""
+        Returns 1-D numpy waveform.
+
+        chunk_frames / overlap_frames 不传时使用加载时的默认配置。
+        """
+        chunk_frames = self.chunk_frames if chunk_frames is None else chunk_frames
+        overlap_frames = self.overlap_frames if overlap_frames is None else overlap_frames
+
         mel = mel.float().to(self.device)
-        wav = self.generator(mel)
-        return wav.squeeze().cpu().numpy()
+        if mel.dim() == 2:
+            mel = mel.unsqueeze(0)
+        total_frames = mel.shape[-1]
+
+        # 短音频或显式关闭分块：整段一次前向
+        if chunk_frames is None or chunk_frames <= 0 or total_frames <= chunk_frames:
+            with self._amp_ctx():
+                wav = self.generator(mel)
+            return wav.squeeze().float().cpu().numpy()
+
+        # 总上采样倍率 = hop_size，输出样本数与输入帧数严格成正比（全等长卷积）
+        upsample = math.prod(self.cfg.model.pupuvocoder.upsample_rates)  # 8*8*2*2*2 = 256
+        ov_samples = overlap_frames * upsample
+        out = None
+        start = 0
+        while start < total_frames:
+            end = min(start + chunk_frames, total_frames)
+            # 末段剩余不足一个重叠区时并入当前块，避免产生过短末块
+            if 0 < total_frames - end < overlap_frames:
+                end = total_frames
+            with self._amp_ctx():
+                wav = self.generator(mel[:, :, start:end])
+            wav = wav.squeeze().float().cpu().numpy()
+            if out is None:
+                out = wav
+            else:
+                # 与上一块的尾部做线性交叉淡化（两版信号在重叠区内高度一致，
+                # 线性淡化即可无缝；重叠帧数远超模型感受野，边界不可闻）
+                n = min(out.size, wav.size, ov_samples)
+                ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+                out[-n:] = out[-n:] * (1.0 - ramp) + wav[:n] * ramp
+                out = np.concatenate([out, wav[n:]])
+            if end >= total_frames:
+                break
+            # 回退 overlap 帧推进，保证下一块与已拼接区域有共同覆盖且严格前进
+            start = max(end - overlap_frames, start + 1)
+        return out
 
 
-def load_pupu_vocoder(checkpoint_dir=None, device=torch.device("cuda")):
+def load_pupu_vocoder(checkpoint_dir=None, device=torch.device("cuda"),
+                      dtype=torch.float32, chunk_frames=512, overlap_frames=64):
     """
     Build PupuVocoder from the local AFGen source tree and load the released
     generator weights (model.safetensors). Returns a PupuVocoderWrapper.
@@ -157,7 +222,7 @@ def load_pupu_vocoder(checkpoint_dir=None, device=torch.device("cuda")):
 
     with _isolated_pupu_imports():
         module = importlib.import_module("models.vocoders.gan.generator.pupuvocoder")
-        generator_cls = getattr(module, "PupuVocoder")
+        generator_cls = module.PupuVocoder
 
     cfg = _build_pupu_cfg()
     generator = generator_cls(cfg)
@@ -169,7 +234,8 @@ def load_pupu_vocoder(checkpoint_dir=None, device=torch.device("cuda")):
             f"Pupu-Vocoder weight mismatch. missing={missing[:8]} "
             f"unexpected={unexpected[:8]}")
     generator.eval()
-    generator = generator.to(device)
+    generator = generator.to(device)  # 权重始终以 fp32 驻留，精度切换由 wrapper 的 autocast 负责
 
-    print(f'[Pupu-Vocoder] loaded generator from {ckpt_file}')
-    return PupuVocoderWrapper(generator, cfg, device)
+    print(f'[Pupu-Vocoder] loaded generator from {ckpt_file} '
+          f'(compute dtype={dtype}, chunk={chunk_frames} frames, overlap={overlap_frames} frames)')
+    return PupuVocoderWrapper(generator, cfg, device, dtype=dtype, chunk_frames=chunk_frames, overlap_frames=overlap_frames)
