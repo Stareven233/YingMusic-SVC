@@ -2,7 +2,7 @@
 YingMusic-SVC inference -- swapped two-stage vocoder pipeline (training-free):
 
     YingMusic-SVC DiT -> predicted Mel
-      -> [stage 1] Pupu-Vocoder            -> temp.wav (intermediate)
+      -> [stage 1] Pupu-Vocoder            -> intermediate waveform (in-memory)
       -> re-extract Mel (PC-NSF params) + explicit F0 from the source audio
          (RMVPE, pitch-controllable via --pitch-shift / --f0-scale)
       -> [stage 2] PC-NSF-HiFiGAN          -> final.flac
@@ -350,8 +350,9 @@ def run_inference(args, bundle, device=torch.device('cuda')):
     '''Voice conversion up to the predicted Mel, then the swapped two-stage
     vocoder synthesis:
 
-      predicted Mel chunks --(concat)--> Pupu-Vocoder --> temp.wav
-      temp.wav --> re-extracted Mel + explicit F0 (pitch-scaled) --> PC-NSF-HiFiGAN --> final.flac
+      predicted Mel chunks --(concat)--> Pupu-Vocoder --> intermediate waveform
+      (in-memory, no disk round-trip) --> re-extracted Mel + explicit F0
+      (pitch-scaled) --> PC-NSF-HiFiGAN --> final.flac
     '''
     model = bundle['model']
     semantic_fn = bundle['semantic_fn']
@@ -523,21 +524,23 @@ def run_inference(args, bundle, device=torch.device('cuda')):
     src_stem, tgt_stem = source.stem, target.stem
 
     # ==================================================================
-    # Stage 1: Pupu-Vocoder -- 预测 Mel -> 中间 WAV
+    # Stage 1: Pupu-Vocoder -- 预测 Mel -> 中间波形（仅驻留内存，不落盘）
     # ==================================================================
     temp_wave = pupu_vocoder.mel_to_wav(pred_mel.cpu())
-    temp_path = exp_path / f'{src_stem}_temp.wav'
-    torchaudio.save(str(temp_path), torch.from_numpy(temp_wave)[None, :].float(), pupu_vocoder.sample_rate)
-    print(f'[stage 1] Pupu-Vocoder wrote {temp_path}')
+    print(f'[stage 1] Pupu-Vocoder -> in-memory waveform ({temp_wave.shape[-1]} samples @ {pupu_vocoder.sample_rate} Hz)')
 
     # ==================================================================
     # Stage 2: 显式 F0 控制 + PC-NSF-HiFiGAN -> 最终 FLAC
     # ==================================================================
-    # 2.1 用 PC-NSF-HiFiGAN 自身的谱参数从中间音频重提取 Mel
+    # 2.1 用 PC-NSF-HiFiGAN 自身的谱参数从中间波形重提取 Mel
     #     （128 bins, hop 512, fmin 40, fmax 16000 @ 44.1 kHz）
-    temp_audio, _ = librosa.load(temp_path, sr=pcnsf_vocoder.sample_rate)
-    temp_audio_t = torch.tensor(temp_audio).unsqueeze(0).float().to(device)
-    new_mel = pcnsf_vocoder.wave_to_mel(temp_audio_t)  # (1, num_mels, frames)
+    # 两级声码器当前均为 44.1 kHz，直接内存传递；若日后换用其它采样率的
+    # Pupu checkpoint，这里在内存里兜底重采样，保证谱参数对齐
+    if pupu_vocoder.sample_rate != pcnsf_vocoder.sample_rate:
+        temp_wave = librosa.resample(temp_wave, orig_sr=pupu_vocoder.sample_rate, target_sr=pcnsf_vocoder.sample_rate)
+        print(f'[stage 2] resampled intermediate waveform to {pcnsf_vocoder.sample_rate} Hz')
+    temp_wave = torch.from_numpy(temp_wave).unsqueeze(0).float().to(device)
+    new_mel = pcnsf_vocoder.wave_to_mel(temp_wave)  # (1, num_mels, frames)
     n_frames = new_mel.shape[2]
 
     # 2.2 从原始输入音频提取显式 F0 条件（复用已加载的 RMVPE，
