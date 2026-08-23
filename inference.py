@@ -18,7 +18,7 @@ https://zread.ai/GiantAILab/YingMusic-SVC/2-quick-start
 https://zread.ai/GiantAILab/YingMusic-SVC/3-model-download-and-setup
 
 uv venv --python=3.10
-./.venv/Scripts/python.exe -c "from modelscope import snapshot_download; snapshot_download('giantailab/YingMusic-SVC', local_dir='./checkpoints')"
+./.venv/Scripts/python.exe -c 'from modelscope import snapshot_download; snapshot_download('giantailab/YingMusic-SVC', local_dir='./checkpoints')'
 uv pip install torch~=2.4.0 torchaudio~=2.4.0 --index-url https://download.pytorch.org/whl/cu124
 uv pip install -r ./requirements.txt
 
@@ -30,19 +30,19 @@ uv run ./inference.py --source 'D:/Document/ai-sings/テオ/【翻唱】将手�
 # Dependency guard: fail early with an actionable message instead of a raw
 # traceback when the environment is not fully provisioned.
 # ---------------------------------------------------------------------------
-_CORE_DEPS = ["numpy", "torch", "torchaudio", "librosa", "yaml", "soundfile"]
+_CORE_DEPS = ['numpy', 'torch', 'torchaudio', 'librosa', 'yaml', 'soundfile']
 
 
 def _check_core_deps():
     import importlib.util
     missing = [mod for mod in _CORE_DEPS if importlib.util.find_spec(mod) is None]
     if missing:
-        print("=" * 72)
-        print("MISSING PYTHON DEPENDENCIES:", ", ".join(missing))
-        print("Please install them yourself (no automatic downloads), e.g.:")
-        print(f"    uv pip install {' '.join(missing)}")
-        print("Plus the new-vocoder extras: uv pip install julius safetensors")
-        print("=" * 72)
+        print('=' * 72)
+        print('MISSING PYTHON DEPENDENCIES:', ', '.join(missing))
+        print('Please install them yourself (no automatic downloads), e.g.:')
+        print(f'    uv pip install {' '.join(missing)}')
+        print('Plus the new-vocoder extras: uv pip install julius safetensors')
+        print('=' * 72)
         raise SystemExit(2)
 
 
@@ -83,13 +83,12 @@ DEFAULT_DIFFUSION_STEPS = 30  # 与下方 --diffusion-steps 默认值保持一�
 CKPT_STEP_PATTERN = re.compile(r'step[=_-](\d+)', re.IGNORECASE)
 
 LOCAL_RMVPE_PATH = Path('./pretrain/rmvpe/model.pt')
-PUPU_VOCODER_DIR = Path('./pretrain/vocoder/Pupu-Vocoder/experiments/pupuvocoder/'
-                        'checkpoint/epoch-0051_step-2553605_loss-62.135194')
+PUPU_VOCODER_DIR = Path('./pretrain/vocoder/Pupu-Vocoder/experiments/pupuvocoder/checkpoint/epoch-0051_step-2553605_loss-62.135194')
 PC_NSF_HIFIGAN_DIR = Path('./pretrain/vocoder/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02')
 
 
 def gen_output_suffix(args: argparse.Namespace) -> str:
-    """由 CLI 参数拼装输出文件名的元数据后缀，形如：
+    '''由 CLI 参数拼装输出文件名的元数据后缀，形如：
 
         YingMusic@10ks_+2st_1.2f0_50step
             │        │   │    │     └─ 扩散步数（非默认时才写入）
@@ -100,7 +99,7 @@ def gen_output_suffix(args: argparse.Namespace) -> str:
             └─ 项目名
 
     与默认值相同的参数不写入，避免文件名冗长。
-    """
+    '''
     *_, ckpt_name = Path(args.checkpoint).parts       # .../YingMusic-SVC-full.pt
     ckpt_tag = Path(ckpt_name).stem.removeprefix(f'{PROJECT_NAME}-') or 'base'
     parts = [f'{PROJECT_NAME}@{ckpt_tag}']
@@ -120,16 +119,16 @@ def gen_output_suffix(args: argparse.Namespace) -> str:
 
 
 def preflight_check(args):
-    """Verify local weights and python dependencies; report what is missing.
+    '''Verify local weights and python dependencies; report what is missing.
 
     Per project policy nothing is downloaded automatically -- missing items
-    are listed so the user can provision them manually."""
+    are listed so the user can provision them manually.'''
     import importlib.util
 
     ok = True
 
-    print("-" * 72)
-    print("[preflight] checking python dependencies ...")
+    print('-' * 72)
+    print('[preflight] checking python dependencies ...')
     # (numpy/torch/librosa/yaml/soundfile already guarded at import time.)
     required_deps = {
         'scipy': 'scipy', 'munch': 'munch', 'einops': 'einops',
@@ -142,52 +141,52 @@ def preflight_check(args):
     missing_deps = [d for d in required_deps if importlib.util.find_spec(d) is None]
     if missing_deps:
         ok = False
-        print(f"  [MISSING] {', '.join(missing_deps)}")
-        print(f"            install manually, e.g.: uv pip install {' '.join(missing_deps)}")
+        print(f'  [MISSING] {', '.join(missing_deps)}')
+        print(f'            install manually, e.g.: uv pip install {' '.join(missing_deps)}')
     else:
-        print("  [OK] all required packages found")
+        print('  [OK] all required packages found')
 
-    print("[preflight] checking model weights ...")
+    print('[preflight] checking model weights ...')
     weight_checks = [
-        ("SVC checkpoint (YingMusic-SVC)", Path(args.checkpoint), True),
-        ("SVC config", Path(args.config), True),
-        ("rmvpe (local)", LOCAL_RMVPE_PATH, False),
-        ("Pupu-Vocoder generator", PUPU_VOCODER_DIR / 'model.safetensors', True),
-        ("PC-NSF-HiFiGAN config", PC_NSF_HIFIGAN_DIR / 'config.json', True),
-        ("PC-NSF-HiFiGAN ckpt", PC_NSF_HIFIGAN_DIR / 'model.ckpt', False),
+        ('SVC checkpoint (YingMusic-SVC)', Path(args.checkpoint), True),
+        ('SVC config', Path(args.config), True),
+        ('rmvpe (local)', LOCAL_RMVPE_PATH, False),
+        ('Pupu-Vocoder generator', PUPU_VOCODER_DIR / 'model.safetensors', True),
+        ('PC-NSF-HiFiGAN config', PC_NSF_HIFIGAN_DIR / 'config.json', True),
+        ('PC-NSF-HiFiGAN ckpt', PC_NSF_HIFIGAN_DIR / 'model.ckpt', False),
     ]
     for label, path, required in weight_checks:
         if path.is_file():
-            print(f"  [OK] {label}: {path}")
+            print(f'  [OK] {label}: {path}')
         elif required:
             ok = False
-            print(f"  [MISSING] {label}: {path}")
+            print(f'  [MISSING] {label}: {path}')
         else:
-            print(f"  [WARN] {label}: {path} not found")
+            print(f'  [WARN] {label}: {path} not found')
 
-    print("[preflight] NOTE: the following are fetched through HuggingFace on "
-          "first run unless already cached:")
-    print("           - openai/whisper-small            (speech tokenizer)")
-    print("           - funasr/campplus                 (style encoder)")
+    print('[preflight] NOTE: the following are fetched through HuggingFace on '
+          'first run unless already cached:')
+    print('           - openai/whisper-small            (speech tokenizer)')
+    print('           - funasr/campplus                 (style encoder)')
     if not LOCAL_RMVPE_PATH.is_file():
-        print("           - lj1995/VoiceConversionWebUI rmvpe.pt (local copy missing)")
-    print("           Set HF_ENDPOINT=https://hf-mirror.com if needed.")
-    print("-" * 72)
+        print('           - lj1995/VoiceConversionWebUI rmvpe.pt (local copy missing)')
+    print('           Set HF_ENDPOINT=https://hf-mirror.com if needed.')
+    print('-' * 72)
 
     if not ok:
-        print("Preflight FAILED. Provision the items above yourself "
-              "(no automatic downloads), then re-run.")
+        print('Preflight FAILED. Provision the items above yourself '
+              '(no automatic downloads), then re-run.')
         raise SystemExit(2)
 
 
 def extract_explicit_f0(f0_fn, waves_16k, thred=0.03):
-    """Extract a continuous explicit F0 trajectory with RMVPE.
+    '''Extract a continuous explicit F0 trajectory with RMVPE.
 
     Reuses the RMVPE model already loaded for SVC conditioning
     (modules/rmvpe.py): it runs on 16 kHz audio and yields one F0 value every
     10 ms (hop 160); unvoiced frames are marked as 0 and are linearly
     interpolated here so the NSF excitation stays smooth.
-    """
+    '''
     f0 = f0_fn(waves_16k, thred=thred)
     f0 = np.asarray(f0, dtype=np.float64).reshape(-1)
 
@@ -203,7 +202,7 @@ def extract_explicit_f0(f0_fn, waves_16k, thred=0.03):
 
 
 def resize_f0_to_frames(f0, n_frames):
-    """Linearly resample an F0 curve onto exactly `n_frames` points."""
+    '''Linearly resample an F0 curve onto exactly `n_frames` points.'''
     if f0.size == n_frames:
         return f0
     x_old = np.linspace(0.0, 1.0, f0.size, endpoint=True)
@@ -211,8 +210,8 @@ def resize_f0_to_frames(f0, n_frames):
     return np.interp(x_new, x_old, f0).astype(np.float32)
 
 
-def load_models_api(args, device=torch.device("cuda")):
-    """加载全部模型并打包为 bundle；推理期需要的派生配置一并放入。"""
+def load_models_api(args, device=torch.device('cuda')):
+    '''加载全部模型并打包为 bundle；推理期需要的派生配置一并放入。'''
     dit_checkpoint_path = Path(args.checkpoint)
     dit_config_path = Path(args.config)
     print(f'load model from {dit_checkpoint_path}')
@@ -224,15 +223,15 @@ def load_models_api(args, device=torch.device("cuda")):
         model_path = LOCAL_RMVPE_PATH
         print(f'load rmvpe from {model_path}')
     else:
-        model_path = load_custom_model_from_hf("lj1995/VoiceConversionWebUI", "rmvpe.pt", None)
+        model_path = load_custom_model_from_hf('lj1995/VoiceConversionWebUI', 'rmvpe.pt', None)
     f0_extractor = RMVPE(model_path, is_half=False, device=device)
     f0_fn = f0_extractor.infer_from_audio
 
     config = yaml.safe_load(dit_config_path.read_text(encoding='utf-8'))
-    model_params = recursive_munch(config["model_params"])
+    model_params = recursive_munch(config['model_params'])
     model_params.dit_type = 'DiT'
-    model = build_model(model_params, stage="DiT")
-    sr = config["preprocess_params"]["sr"]
+    model = build_model(model_params, stage='DiT')
+    sr = config['preprocess_params']['sr']
 
     model, _, _, _ = load_checkpoint(
         model,
@@ -252,16 +251,16 @@ def load_models_api(args, device=torch.device("cuda")):
     from modules.campplus.DTDNN import CAMPPlus
 
     campplus_ckpt_path = load_custom_model_from_hf(
-        "funasr/campplus", "campplus_cn_common.bin", config_filename=None
+        'funasr/campplus', 'campplus_cn_common.bin', config_filename=None
     )
 
     campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
-    campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
+    campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location='cpu'))
     campplus_model.eval()
     campplus_model.to(device)
 
     # ------------------------------------------------------------------
-    # NOTE: the original bigvgan ("BigGAN") vocoder block was removed here.
+    # NOTE: the original bigvgan ('BigGAN') vocoder block was removed here.
     # Synthesis now goes through Pupu-Vocoder + PC-NSF-HiFiGAN (see
     # run_inference); the DiT-predicted Mel is never vocoded by bigvgan.
     # ------------------------------------------------------------------
@@ -278,7 +277,7 @@ def load_models_api(args, device=torch.device("cuda")):
 
         def semantic_fn(waves_16k):
             ori_inputs = whisper_feature_extractor([waves_16k.squeeze(0).cpu().numpy()],
-                                                   return_tensors="pt",
+                                                   return_tensors='pt',
                                                    return_attention_mask=True)
             ori_input_features = whisper_model._mask_input_features(
                 ori_inputs.input_features, attention_mask=ori_inputs.attention_mask).to(device)
@@ -294,18 +293,18 @@ def load_models_api(args, device=torch.device("cuda")):
             S_ori = S_ori[:, :waves_16k.size(-1) // 320 + 1]
             return S_ori
     else:
-        raise ValueError(f"Unknown speech tokenizer type: {speech_tokenizer_type}")
+        raise ValueError(f'Unknown speech tokenizer type: {speech_tokenizer_type}')
 
     # Generate mel spectrograms (SVC model convention: ln-compressed, fmin=0)
     mel_fn_args = {
-        "n_fft": config['preprocess_params']['spect_params']['n_fft'],
-        "win_size": config['preprocess_params']['spect_params']['win_length'],
-        "hop_size": config['preprocess_params']['spect_params']['hop_length'],
-        "num_mels": config['preprocess_params']['spect_params']['n_mels'],
-        "sampling_rate": sr,
-        "fmin": config['preprocess_params']['spect_params'].get('fmin', 0),
-        "fmax": None if config['preprocess_params']['spect_params'].get('fmax', "None") == "None" else 8000,
-        "center": False
+        'n_fft': config['preprocess_params']['spect_params']['n_fft'],
+        'win_size': config['preprocess_params']['spect_params']['win_length'],
+        'hop_size': config['preprocess_params']['spect_params']['hop_length'],
+        'num_mels': config['preprocess_params']['spect_params']['n_mels'],
+        'sampling_rate': sr,
+        'fmin': config['preprocess_params']['spect_params'].get('fmin', 0),
+        'fmax': None if config['preprocess_params']['spect_params'].get('fmax', 'None') == 'None' else 8000,
+        'center': False
     }
 
     def to_mel(x):
@@ -316,37 +315,37 @@ def load_models_api(args, device=torch.device("cuda")):
     pcnsf_vocoder = load_pc_nsf_hifigan(PC_NSF_HIFIGAN_DIR, device=device)  # stage 2
 
     return {
-        "model": model,
-        "semantic_fn": semantic_fn,
-        "f0_fn": f0_fn,
-        "campplus_model": campplus_model,
-        "mel_fn": to_mel,
-        "mel_fn_args": mel_fn_args,
-        "pupu_vocoder": pupu_vocoder,
-        "pcnsf_vocoder": pcnsf_vocoder,
+        'model': model,
+        'semantic_fn': semantic_fn,
+        'f0_fn': f0_fn,
+        'campplus_model': campplus_model,
+        'mel_fn': to_mel,
+        'mel_fn_args': mel_fn_args,
+        'pupu_vocoder': pupu_vocoder,
+        'pcnsf_vocoder': pcnsf_vocoder,
         # 推理期不再重复读取 yaml：这里预取 length_regulator 的开关
-        "use_style_residual":
+        'use_style_residual':
             config['model_params']['length_regulator'].get('use_style_residual', False),
     }
 
 
 @torch.no_grad()
-def run_inference(args, bundle, device=torch.device("cuda")):
-    """Voice conversion up to the predicted Mel, then the swapped two-stage
+def run_inference(args, bundle, device=torch.device('cuda')):
+    '''Voice conversion up to the predicted Mel, then the swapped two-stage
     vocoder synthesis:
 
       predicted Mel chunks --(concat)--> Pupu-Vocoder --> temp.wav
       temp.wav --> re-extracted Mel + explicit F0 (pitch-scaled) --> PC-NSF-HiFiGAN --> final.flac
-    """
-    model = bundle["model"]
-    semantic_fn = bundle["semantic_fn"]
-    f0_fn = bundle["f0_fn"]
-    campplus_model = bundle["campplus_model"]
-    mel_fn = bundle["mel_fn"]
-    mel_fn_args = bundle["mel_fn_args"]
-    pupu_vocoder = bundle["pupu_vocoder"]
-    pcnsf_vocoder = bundle["pcnsf_vocoder"]
-    use_style_residual = bundle["use_style_residual"]
+    '''
+    model = bundle['model']
+    semantic_fn = bundle['semantic_fn']
+    f0_fn = bundle['f0_fn']
+    campplus_model = bundle['campplus_model']
+    mel_fn = bundle['mel_fn']
+    mel_fn_args = bundle['mel_fn_args']
+    pupu_vocoder = bundle['pupu_vocoder']
+    pcnsf_vocoder = bundle['pcnsf_vocoder']
+    use_style_residual = bundle['use_style_residual']
 
     fp16 = args.fp16
     f0_condition = args.f0_condition
@@ -455,11 +454,13 @@ def run_inference(args, bundle, device=torch.device("cuda")):
     # 进度条实时显示已处理帧数 / 总条件帧数
     pbar = tqdm(total=total_frames, desc='flow-matching', unit='frame', dynamic_ncols=True)
     while processed_frames < total_frames:
-        chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
+        # 显式确定本块终点：中间块取满窗口、末块负责收尾（可不足一窗）
+        chunk_end = min(processed_frames + max_source_window, total_frames)
+        chunk_cond = cond[:, processed_frames:chunk_end]
         cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
         # use_style_residual
         if use_style_residual:
-            chunk_style_cond = style_cond[:, processed_frames:processed_frames + max_source_window]
+            chunk_style_cond = style_cond[:, processed_frames:chunk_end]
             cat_style_cond = torch.cat([style_prompt, chunk_style_cond], dim=1)
         else:
             cat_style_cond = None
@@ -479,16 +480,24 @@ def run_inference(args, bundle, device=torch.device("cuda")):
             pred_mel_chunks.append(vc_target.float())
         else:
             pred_mel_chunks.append(vc_target.float()[:, :, overlap_frame_len:])
-        advance = vc_target.size(2) - overlap_frame_len
-        processed_frames += advance
-        pbar.update(min(advance, total_frames - pbar.n))
+        # 关键修复：原实现按 `advance = 本块输出帧数 - overlap` 推进，
+        # 当尾部剩余帧数收敛到恰好 overlap_frame_len 时 advance 恒为 0，
+        # processed_frames 永远无法到达 total_frames -> 死循环
+        # （表现为进度条停在约 99.9%（显示成 100%）但推理永不结束）。
+        # 现改为显式跳到本块终点：中间块回退 overlap 帧以便与下一块无缝拼接，
+        # 末块处理完直接退出；max() 兜底保证 processed_frames 严格单调前进。
+        if chunk_end >= total_frames:
+            pbar.update(total_frames - pbar.n)
+            break
+        processed_frames = max(chunk_end - overlap_frame_len, processed_frames + 1)
+        pbar.update(processed_frames - pbar.n)
     pbar.close()
 
     pred_mel = torch.cat(pred_mel_chunks, dim=2)  # (1, num_mels, frames)
     print(f'predicted Mel: {pred_mel.shape[2]} frames @ {sr} Hz')
 
     time_vc_end = time.time()
-    print(f"SVC/DiT stage RTF: {(time_vc_end - time_vc_start) / (pred_mel.size(2) * hop_length) * sr}")
+    print(f'SVC/DiT stage RTF: {(time_vc_end - time_vc_start) / (pred_mel.size(2) * hop_length) * sr}')
 
     exp_path = Path(args.output) / args.expname
     exp_path.mkdir(parents=True, exist_ok=True)  # 连同 --output 根目录一并创建
@@ -526,7 +535,7 @@ def run_inference(args, bundle, device=torch.device("cuda")):
     final_tensor = torch.clamp(torch.from_numpy(final_wave)[None, :].float(), -1.0, 1.0)
 
     time_synth_end = time.time()
-    print(f"Overall RTF: {(time_synth_end - time_vc_start) / final_tensor.size(-1) * sr}")
+    print(f'Overall RTF: {(time_synth_end - time_vc_start) / final_tensor.size(-1) * sr}')
 
     # 输出统一为 FLAC，文件名附带元数据后缀（项目名/ckpt/变调等）
     vc_stem = f'{src_stem}_{tgt_stem}_{gen_output_suffix(args)}'
@@ -538,40 +547,40 @@ def run_inference(args, bundle, device=torch.device("cuda")):
     return output_path
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="YingMusic-SVC inference with Pupu-Vocoder -> PC-NSF-HiFiGAN "
-                    "two-stage synthesis and explicit F0 (pitch) control.")
-    parser.add_argument("--source", type=str, help="Source vocal audio (wav/flac/mp3 ...)")
-    parser.add_argument("--target", type=str, help="Reference audio providing the target timbre")
-    parser.add_argument("--diffusion-steps", type=int, default=DEFAULT_DIFFUSION_STEPS)
-    parser.add_argument("--checkpoint", type=str, default='./checkpoints/YingMusic-SVC-full.pt',
-                        help="Path to the SVC checkpoint file")
-    parser.add_argument("--expname", type=str, default='swap_vocoder')
-    parser.add_argument("--cuda", type=str, default='0')
-    parser.add_argument("--fp16", type=str, default='True')
-    parser.add_argument("--accompany", type=str, default=None,
-                        help="Optional accompaniment track for remixing (echo/reverb)")
-    parser.add_argument("--config", type=str, default='./configs/YingMusic-SVC.yml')
+        description='YingMusic-SVC inference with Pupu-Vocoder -> PC-NSF-HiFiGAN '
+                    'two-stage synthesis and explicit F0 (pitch) control.')
+    parser.add_argument('--source', type=str, help='Source vocal audio (wav/flac/mp3 ...)')
+    parser.add_argument('--target', type=str, help='Reference audio providing the target timbre')
+    parser.add_argument('--diffusion-steps', type=int, default=DEFAULT_DIFFUSION_STEPS)
+    parser.add_argument('--checkpoint', type=str, default='./checkpoints/YingMusic-SVC-full.pt',
+                        help='Path to the SVC checkpoint file')
+    parser.add_argument('--expname', type=str, default='swap_vocoder')
+    parser.add_argument('--cuda', type=str, default='0')
+    parser.add_argument('--fp16', type=str, default='True')
+    parser.add_argument('--accompany', type=str, default=None,
+                        help='Optional accompaniment track for remixing (echo/reverb)')
+    parser.add_argument('--config', type=str, default='./configs/YingMusic-SVC.yml')
 
     # --- 显式音高控制（作用于最终 PC-NSF-HiFiGAN 阶段） ---
-    parser.add_argument("--pitch-shift", type=float, default=0.0, dest='pitch_shift', help="Pitch shift in semitones applied to the explicit F0 "
-                             "condition of PC-NSF-HiFiGAN (e.g. 2.0 = +2 semitones up)")
-    parser.add_argument("--f0-scale", type=float, default=1.0, dest='f0_scale',
-                        help="Direct multiplicative scale on the explicit F0 "
-                             "(e.g. 1.2 ~= up 3.2 semitones, 0.8 ~= down 3.9 semitones); "
-                             "applied on top of --pitch-shift")
+    parser.add_argument('--pitch-shift', type=float, default=0.0, dest='pitch_shift', help='Pitch shift in semitones applied to the explicit F0 '
+                             'condition of PC-NSF-HiFiGAN (e.g. 2.0 = +2 semitones up)')
+    parser.add_argument('--f0-scale', type=float, default=1.0, dest='f0_scale',
+                        help='Direct multiplicative scale on the explicit F0 '
+                             '(e.g. 1.2 ~= up 3.2 semitones, 0.8 ~= down 3.9 semitones); '
+                             'applied on top of --pitch-shift')
 
-    parser.add_argument("--semi-tone-shift", type=float, default=None, dest='semi_tone_shift',
+    parser.add_argument('--semi-tone-shift', type=float, default=None, dest='semi_tone_shift',
                         help="Forced semi-tone shift for the SVC model's internal adaptive F0 alignment; None keeps automatic sandhi")
-    parser.add_argument("--length-adjust", type=float, default=1.0, dest='length_adjust')
-    parser.add_argument("--inference-cfg-rate", type=float, default=0.7, dest='inference_cfg_rate')
-    parser.add_argument("--output", type=str, default='./outputs')
-    parser.add_argument("--skip-check", action='store_true', dest='skip_check',
-                        help="Skip the pre-flight dependency/weight check")
+    parser.add_argument('--length-adjust', type=float, default=1.0, dest='length_adjust')
+    parser.add_argument('--inference-cfg-rate', type=float, default=0.7, dest='inference_cfg_rate')
+    parser.add_argument('--output', type=str, default='./outputs')
+    parser.add_argument('--skip-check', action='store_true', dest='skip_check',
+                        help='Skip the pre-flight dependency/weight check')
     args = parser.parse_args()
 
-    args.cuda = torch.device(f"cuda:{args.cuda}")
+    args.cuda = torch.device(f'cuda:{args.cuda}')
     args.fp16 = str2bool(args.fp16)
     if args.fp16:
         print('Start fp16 to accelerate inference！')
