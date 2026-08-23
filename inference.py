@@ -23,7 +23,8 @@ uv pip install torch~=2.4.0 torchaudio~=2.4.0 --index-url https://download.pytor
 uv pip install -r ./requirements.txt
 
 ./.venv/Scripts/python.exe inference.py --source vocal.wav --target timbre.wav
-uv run ./inference.py --source 'D:/Document/ai-sings/テオ/【翻唱】将手（テオ） ／ Omoi【Kotone(天神子兔音)cover】_Vocals_vocals_noreverb.flac' --target 'D:/Code/projects/DDSP-SVC/data/megumin/train/audio/ちいさな冒険者 めぐみん Version - 高橋李依_vocals_noreverb_0007.wav'
+./.venv/Scripts/python.exe inference.py --source vocal.wav --target timbre1.wav timbre2.wav  # 多段参考拼接
+uv run ./inference.py --source 'D:/Document/ai-sings/テオ/【翻唱】将手（テオ） ／ Omoi【Kotone(天神子兔音)cover】_Vocals_vocals_noreverb.flac' --target 'D:/Code/projects/DDSP-SVC/data/megumin/train/audio/ちいさな冒険者 めぐみん Version - 高橋李依_vocals_noreverb_0007.wav' 'D:/Code/projects/DDSP-SVC/data/megumin/train/audio/101匹目の羊 -めぐみん Ver.- - 高橋李依_vocals_noreverb_0006.wav' 'D:/Code/projects/DDSP-SVC/data/megumin/train/audio/おうちに帰りたい -めぐみん ver.- - 高橋李依_vocals_noreverb_0016.wav'
 '''
 
 # ---------------------------------------------------------------------------
@@ -98,23 +99,23 @@ PC_NSF_HIFIGAN_DIR = Path('./pretrain/vocoder/pc_nsf_hifigan_44.1k_hop512_128bin
 def gen_output_suffix(args: argparse.Namespace) -> str:
     '''由 CLI 参数拼装输出文件名的元数据后缀，形如：
 
-        YingMusic@10ks_+2st_1.2f0_50step
-            │        │   │    │     └─ 扩散步数（非默认时才写入）
-            │        │   │    └─ 显式 F0 缩放（非 1.0 时才写入）
-            │        │   └─ 变调（semitones，恒写入）
-            │        │
-            │        └─ ckpt 训练步数（文件名可解析出 step 时写入）
+        YingMusic@+2key_10ks_3ref_1.2f0_50step
+            │         │     │    │      │     └─ 扩散步数（非默认时才写入）
+            │         │     │    │      └─ 显式 F0 缩放（非 1.0 时才写入）
+            │         │     │    └─ 参考片段数（多于 1 段时才写入）
+            │         │     └─ ckpt 训练步数（文件名可解析出 step 时写入）
+            │         └─ 变调（semitones）
             └─ 项目名
 
     与默认值相同的参数不写入，避免文件名冗长。
     '''
     *_, ckpt_name = Path(args.checkpoint).parts       # .../YingMusic-SVC-full.pt
-    ckpt_tag = Path(ckpt_name).stem.removeprefix(f'{PROJECT_NAME}-') or 'base'
-    parts = [f'{PROJECT_NAME}@{ckpt_tag}']
+    parts = [f'{PROJECT_NAME}@{args.pitch_shift:+g}key']  # 变调恒写入，如 '+2key'/'-1.5key'
 
     if (m := CKPT_STEP_PATTERN.search(ckpt_name)):
         parts.append(f'{int(m.group(1)) / 1000:g}ks')  # 10000 -> '10ks'
-    parts.append(f'{args.pitch_shift:+g}key')           # 变调恒写入，如 '+2key'/'-1.5key'
+    if (n_ref := len(args.target)) > 1:
+        parts.append(f'{n_ref}ref')  # 多段参考音频拼接时记录片段数
     if args.f0_scale != 1.0:
         parts.append(f'{args.f0_scale:g}f0')
     if args.semi_tone_shift is not None:
@@ -368,14 +369,19 @@ def run_inference(args, bundle, device=torch.device('cuda')):
     f0_condition = args.f0_condition
     diffusion_steps = args.diffusion_steps
 
-    source, target = Path(args.source), Path(args.target)
+    source = Path(args.source)
+    target_paths = [Path(t) for t in args.target]
     print(f'[input] source: {source}')
-    print(f'[input] target: {target}')
+    for i, t in enumerate(target_paths):
+        print(f'[input] target[{i}]: {t}')
 
     # 先以模型自身采样率加载音频；管线内部采样率随后按是否带 F0 条件重定义
     model_sr = mel_fn_args['sampling_rate']
     source_audio = torch.tensor(librosa.load(source, sr=model_sr)[0]).unsqueeze(0).float().to(device)
-    ref_audio = torch.tensor(librosa.load(target, sr=model_sr)[0][:model_sr * 25]).unsqueeze(0).float().to(device)
+    # 参考音频支持多段：单段不足 25 s 时可传多个，按顺序拼接后仍截断到 25 s 上限
+    ref_parts = [torch.tensor(librosa.load(t, sr=model_sr)[0][:model_sr * 25]) for t in target_paths]
+    ref_audio = torch.cat(ref_parts)[:model_sr * 25].unsqueeze(0).float().to(device)
+    print(f'[input] {len(ref_parts)} ref clip(s), {ref_audio.size(-1) / model_sr:.2f}s used')
 
     sr = 22050 if not f0_condition else 44100
     hop_length = 256 if not f0_condition else 512
@@ -519,9 +525,10 @@ def run_inference(args, bundle, device=torch.device('cuda')):
     # DiT 主干推理结束：把缓存池里的碎片化显存归还驱动，给声码器腾出连续空间
     torch.cuda.empty_cache()
 
-    exp_path = Path(args.output) / args.expname
-    exp_path.mkdir(parents=True, exist_ok=True)  # 连同 --output 根目录一并创建
-    src_stem, tgt_stem = source.stem, target.stem
+    # 未显式指定 --output 时，结果直接写到源音频所在目录
+    out_dir = source.parent if args.output is None else Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src_stem = source.stem
 
     # ==================================================================
     # Stage 1: Pupu-Vocoder -- 预测 Mel -> 中间波形（仅驻留内存，不落盘）
@@ -558,10 +565,10 @@ def run_inference(args, bundle, device=torch.device('cuda')):
     print(f'Overall RTF: {(time_synth_end - time_vc_start) / final_tensor.size(-1) * sr}')
 
     # 输出统一为 FLAC，文件名附带元数据后缀（项目名/ckpt/变调等）
-    vc_stem = f'{src_stem}_{tgt_stem}_{gen_output_suffix(args)}'
+    vc_stem = f'{src_stem}_{gen_output_suffix(args)}'
     if uuid := getattr(args, 'uuid', None):
         vc_stem += f'_{uuid}'
-    output_path = exp_path / f'{vc_stem}.flac'
+    output_path = out_dir / f'{vc_stem}.flac'
     torchaudio.save(str(output_path), final_tensor.cpu(), sr)
     print(f'[stage 2] PC-NSF-HiFiGAN wrote {output_path}')
     return output_path
@@ -572,11 +579,12 @@ if __name__ == '__main__':
         description='YingMusic-SVC inference with Pupu-Vocoder -> PC-NSF-HiFiGAN '
                     'two-stage synthesis and explicit F0 (pitch) control.')
     parser.add_argument('--source', type=str, help='Source vocal audio (wav/flac/mp3 ...)')
-    parser.add_argument('--target', type=str, help='Reference audio providing the target timbre')
+    parser.add_argument('--target', type=str, nargs='+',
+                        help='Reference audio(s) providing the target timbre; '
+                             '可传多段，按顺序拼接后截断至 25 s')
     parser.add_argument('--diffusion-steps', type=int, default=DEFAULT_DIFFUSION_STEPS)
     parser.add_argument('--checkpoint', type=str, default='./checkpoints/YingMusic-SVC-full.pt',
                         help='Path to the SVC checkpoint file')
-    parser.add_argument('--expname', type=str, default='swap_vocoder')
     parser.add_argument('--cuda', type=str, default='0')
     parser.add_argument('--fp16', type=str, default='True')
     parser.add_argument('--accompany', type=str, default=None,
@@ -595,7 +603,8 @@ if __name__ == '__main__':
                         help="Forced semi-tone shift for the SVC model's internal adaptive F0 alignment; None keeps automatic sandhi")
     parser.add_argument('--length-adjust', type=float, default=1.0, dest='length_adjust')
     parser.add_argument('--inference-cfg-rate', type=float, default=0.7, dest='inference_cfg_rate')
-    parser.add_argument('--output', type=str, default='./outputs')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output directory; 默认 None 表示直接写到源音频所在目录')
     parser.add_argument('--skip-check', action='store_true', dest='skip_check',
                         help='Skip the pre-flight dependency/weight check')
 
@@ -623,7 +632,7 @@ if __name__ == '__main__':
     models = load_models_api(args, device=args.cuda)
     vc = run_inference(args, models, device=args.cuda)
     if args.accompany:
-        # 回声+混响 remix，产物写入 outputs/<expname>/accompany/
+        # 回声+混响 remix，产物写入输出目录下的 accompany/
         acc_dir = vc.parent / 'accompany'
         acc_dir.mkdir(parents=True, exist_ok=True)
         echo_then_reverb_save(str(vc), str(acc_dir / vc.name), args.accompany)
