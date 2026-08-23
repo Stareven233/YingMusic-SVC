@@ -1,8 +1,7 @@
 # logger.py
-import os
 import logging
+import os
 import threading
-
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 
@@ -15,7 +14,7 @@ class Logger:
         if not cls._instance:
             with cls._lock:
                 if not cls._instance:  # 双重检查锁
-                    cls._instance = super(Logger, cls).__new__(cls)
+                    cls._instance = super().__new__(cls)
                     cls._instance._initialized = False
         return cls._instance
 

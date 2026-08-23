@@ -1,15 +1,12 @@
-from io import BytesIO
+import logging
 import os
-from typing import List, Optional, Tuple
+
 import numpy as np
 import torch
-
-import torch.nn as nn
 import torch.nn.functional as F
-from librosa.util import normalize, pad_center, tiny
+from librosa.util import pad_center
 from scipy.signal import get_window
-
-import logging
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +30,7 @@ class STFT(torch.nn.Module):
             window {str} -- Type of window to use (options are bartlett, hann, hamming, blackman, blackmanharris)
                 (default: {'hann'})
         """
-        super(STFT, self).__init__()
+        super().__init__()
         self.filter_length = filter_length
         self.hop_length = hop_length
         self.win_length = win_length if win_length else filter_length
@@ -42,7 +39,7 @@ class STFT(torch.nn.Module):
         self.pad_amount = int(self.filter_length / 2)
         fourier_basis = np.fft.fft(np.eye(self.filter_length))
 
-        cutoff = int((self.filter_length / 2 + 1))
+        cutoff = int(self.filter_length / 2 + 1)
         fourier_basis = np.vstack(
             [np.real(fourier_basis[:cutoff, :]), np.imag(fourier_basis[:cutoff, :])]
         )
@@ -144,12 +141,11 @@ class STFT(torch.nn.Module):
         return reconstruction
 
 
-from time import time as ttime
 
 
 class BiGRU(nn.Module):
     def __init__(self, input_features, hidden_features, num_layers):
-        super(BiGRU, self).__init__()
+        super().__init__()
         self.gru = nn.GRU(
             input_features,
             hidden_features,
@@ -164,7 +160,7 @@ class BiGRU(nn.Module):
 
 class ConvBlockRes(nn.Module):
     def __init__(self, in_channels, out_channels, momentum=0.01):
-        super(ConvBlockRes, self).__init__()
+        super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(
                 in_channels=in_channels,
@@ -209,7 +205,7 @@ class Encoder(nn.Module):
         out_channels=16,
         momentum=0.01,
     ):
-        super(Encoder, self).__init__()
+        super().__init__()
         self.n_encoders = n_encoders
         self.bn = nn.BatchNorm2d(in_channels, momentum=momentum)
         self.layers = nn.ModuleList()
@@ -228,7 +224,7 @@ class Encoder(nn.Module):
         self.out_channel = out_channels
 
     def forward(self, x: torch.Tensor):
-        concat_tensors: List[torch.Tensor] = []
+        concat_tensors: list[torch.Tensor] = []
         x = self.bn(x)
         for i, layer in enumerate(self.layers):
             t, x = layer(x)
@@ -240,7 +236,7 @@ class ResEncoderBlock(nn.Module):
     def __init__(
         self, in_channels, out_channels, kernel_size, n_blocks=1, momentum=0.01
     ):
-        super(ResEncoderBlock, self).__init__()
+        super().__init__()
         self.n_blocks = n_blocks
         self.conv = nn.ModuleList()
         self.conv.append(ConvBlockRes(in_channels, out_channels, momentum))
@@ -259,9 +255,9 @@ class ResEncoderBlock(nn.Module):
             return x
 
 
-class Intermediate(nn.Module):  #
+class Intermediate(nn.Module):
     def __init__(self, in_channels, out_channels, n_inters, n_blocks, momentum=0.01):
-        super(Intermediate, self).__init__()
+        super().__init__()
         self.n_inters = n_inters
         self.layers = nn.ModuleList()
         self.layers.append(
@@ -280,7 +276,7 @@ class Intermediate(nn.Module):  #
 
 class ResDecoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride, n_blocks=1, momentum=0.01):
-        super(ResDecoderBlock, self).__init__()
+        super().__init__()
         out_padding = (0, 1) if stride == (1, 2) else (1, 1)
         self.n_blocks = n_blocks
         self.conv1 = nn.Sequential(
@@ -311,7 +307,7 @@ class ResDecoderBlock(nn.Module):
 
 class Decoder(nn.Module):
     def __init__(self, in_channels, n_decoders, stride, n_blocks, momentum=0.01):
-        super(Decoder, self).__init__()
+        super().__init__()
         self.layers = nn.ModuleList()
         self.n_decoders = n_decoders
         for i in range(self.n_decoders):
@@ -321,7 +317,7 @@ class Decoder(nn.Module):
             )
             in_channels = out_channels
 
-    def forward(self, x: torch.Tensor, concat_tensors: List[torch.Tensor]):
+    def forward(self, x: torch.Tensor, concat_tensors: list[torch.Tensor]):
         for i, layer in enumerate(self.layers):
             x = layer(x, concat_tensors[-1 - i])
         return x
@@ -337,7 +333,7 @@ class DeepUnet(nn.Module):
         in_channels=1,
         en_out_channels=16,
     ):
-        super(DeepUnet, self).__init__()
+        super().__init__()
         self.encoder = Encoder(
             in_channels, 128, en_de_layers, kernel_size, n_blocks, en_out_channels
         )
@@ -369,7 +365,7 @@ class E2E(nn.Module):
         in_channels=1,
         en_out_channels=16,
     ):
-        super(E2E, self).__init__()
+        super().__init__()
         self.unet = DeepUnet(
             kernel_size,
             n_blocks,
@@ -480,6 +476,46 @@ class MelSpectrogram(torch.nn.Module):
         return log_mel_spec
 
 
+def load_rmvpe_state_dict(model_path: str) -> dict:
+    """Extract a clean E2E state dict from an RMVPE checkpoint file.
+
+    Supports both the official bare ``rmvpe.pt`` state dict and the full
+    training checkpoints released by the RMVPE training repo (yxlllc/RMVPE /
+    openvpi), which wrap the weights as ``{"model": state_dict}`` together
+    with optimizer states and an unused auxiliary ``unet.tf.*``
+    (TimbreFilter) branch that never participates in the forward pass.
+    """
+    ckpt = torch.load(model_path, map_location="cpu")
+
+    def is_state_dict(d):
+        return (
+            isinstance(d, dict)
+            and len(d) > 0
+            and all(torch.is_tensor(v) for v in d.values())
+        )
+
+    if not isinstance(ckpt, dict):
+        raise TypeError(
+            f"Unsupported RMVPE checkpoint format: {type(ckpt)} ({model_path})"
+        )
+
+    # unwrap common training-checkpoint wrappers
+    if not is_state_dict(ckpt):
+        for key in ("model", "state_dict", "net", "generator", "weights"):
+            inner = ckpt.get(key)
+            if is_state_dict(inner):
+                ckpt = inner
+                break
+
+    # strip DDP prefixes if present
+    cleaned = {}
+    for k, v in ckpt.items():
+        while k.startswith("module."):
+            k = k[len("module."):]
+        cleaned[k] = v
+    return cleaned
+
+
 class RMVPE:
     def __init__(self, model_path: str, is_half, device=None, use_jit=False):
         self.resample_kernel = {}
@@ -501,7 +537,7 @@ class RMVPE:
             import onnxruntime as ort
 
             ort_session = ort.InferenceSession(
-                "%s/rmvpe.onnx" % os.environ["rmvpe_root"],
+                "{}/rmvpe.onnx".format(os.environ["rmvpe_root"]),
                 providers=["DmlExecutionProvider"],
             )
             self.model = ort_session
@@ -511,8 +547,26 @@ class RMVPE:
 
             def get_default_model():
                 model = E2E(4, 1, (2, 2))
-                ckpt = torch.load(model_path, map_location="cpu")
-                model.load_state_dict(ckpt)
+                state_dict = load_rmvpe_state_dict(model_path)
+                incompatible = model.load_state_dict(state_dict, strict=False)
+                missing = incompatible.missing_keys
+                unexpected = incompatible.unexpected_keys
+                if missing:
+                    raise RuntimeError(
+                        f"Error(s) in loading state_dict for E2E "
+                        f"(from {model_path}):\n\t"
+                        f"Missing key(s): {sorted(missing)[:10]} ..."
+                    )
+                if unexpected:
+                    # e.g. the unused 'unet.tf.*' TimbreFilter branch saved by
+                    # training checkpoints; it does not affect inference.
+                    logger.warning(
+                        "RMVPE checkpoint %s has %d unused keys that are "
+                        "ignored (e.g. %s).",
+                        model_path,
+                        len(unexpected),
+                        sorted(unexpected)[:4],
+                    )
                 model.eval()
                 if is_half:
                     model = model.half()

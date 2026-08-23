@@ -1,17 +1,18 @@
+# ===================== BASECFM Euler Visualizer (copy-paste) =====================
+import os
 from abc import ABC
-import torch.distributed as dist
-import torch
-import torch.nn.functional as F
 
-from modules.diffusion_transformer import DiT
-from modules.commons import sequence_mask
+import matplotlib.pyplot as plt
+import torch
+import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
-# ===================== BASECFM Euler Visualizer (copy-paste) =====================
-import os
-import torch
-import matplotlib.pyplot as plt
+from modules.diffusion_transformer import DiT
+from utils.progress_bar import Dummy_Bar
+
+dbar = Dummy_Bar()
+
 
 @torch.no_grad()
 def visualize_basecfm_euler_run(
@@ -147,7 +148,7 @@ class BASECFM(torch.nn.Module, ABC):
             self.zero_prompt_speech_token = False
 
     @torch.inference_mode()
-    def inference(self, mu, x_lens, prompt, style, f0, n_timesteps, temperature=1.0, inference_cfg_rate=0.5, style_r=None):
+    def inference(self, mu, x_lens, prompt, style, f0, n_timesteps, temperature=1.0, inference_cfg_rate=0.5, style_r=None, pbar=tqdm):
         """Forward diffusion
 
         Args:
@@ -169,9 +170,9 @@ class BASECFM(torch.nn.Module, ABC):
         z = torch.randn([B, self.in_channels, T], device=mu.device) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
         # t_span = t_span + (-1) * (torch.cos(torch.pi / 2 * t_span) - 1 + t_span)
-        return self.solve_euler(z, x_lens, prompt, mu, style, t_span, inference_cfg_rate, style_r=style_r)
+        return self.solve_euler(z, x_lens, prompt, mu, style, t_span, inference_cfg_rate, style_r=style_r, pbar=pbar)
 
-    def solve_euler(self, x, x_lens, prompt, mu, style, t_span, inference_cfg_rate=0.5, style_r=None):
+    def solve_euler(self, x, x_lens, prompt, mu, style, t_span, inference_cfg_rate=0.5, style_r=None, pbar=tqdm):
         """
         Fixed euler solver for ODEs.
         Args:
@@ -200,10 +201,11 @@ class BASECFM(torch.nn.Module, ABC):
             mu[..., :prompt_len] = 0
 
         # ★ 记录 y0（置零后的初始）
-        y0_vis = x.clone()
+        # y0_vis = x.clone()
+        pbar = pbar or dbar
 
 
-        for step in tqdm(range(1, len(t_span))):
+        for step in pbar(range(1, len(t_span))):
             dt = t_span[step] - t_span[step - 1]
             if inference_cfg_rate > 0:
                 # Stack original and CFG (null) inputs for batched processing
@@ -604,7 +606,6 @@ def _all_reduce_mean_(x: torch.Tensor):
     return x
 
 
-import matplotlib.pyplot as plt
 
 def plot_mel(
     mel,
@@ -616,6 +617,8 @@ def plot_mel(
     vmin: float | None = None,      # 若是 dB，可以设置下限比如 -80
     vmax: float | None = None       # 若是 dB，可以设置上限比如 0
 ):
+    import numpy as np
+
     # 转成 numpy
     if isinstance(mel, torch.Tensor):
         x = mel.detach().cpu().float().numpy()
