@@ -1,0 +1,159 @@
+key: yingmusic-svc
+name: YingMusic-SVC 推理
+desc: |
+  代码仓库：[Stareven233/YingMusic-SVC](https://github.com/Stareven233/YingMusic-SVC)  
+  根据[Da1sypetals博客](https://blog.petals.top/learn/2026-08-11-ai-singer-and-problem-in-yingmusic/)的思路对[官方仓库](https://github.com/GiantAILab/YingMusic-SVC)进行声码器部分的改造：DiT 声学模型 + Pupu-Vocoder -> PC-NSF-HiFiGAN 两级声码，支持显式 F0 音高控制
+meta:
+  ym_dir:
+    dtype: directory
+    method: select|resolve
+    # value: &ym_dir ./library/YingMusic-SVC
+    value: &ym_dir D:/Code/projects/YingMusic-SVC
+  python:
+    dtype: file
+    method: select|resolve
+    # value: ./bin/venv-svc/Scripts/python.exe
+    value: D:/Code/projects/YingMusic-SVC/.venv/Scripts/python.exe
+modules:
+  - key: infer
+    name: 推理
+    desc: 将源人声转换为参考音色并输出 FLAC
+    template:
+      - 'cd "#{ym_dir}"'
+      - '& "#{python}" inference.py#{source}#{target}#{diffusion_steps}#{checkpoint}#{cuda}#{fp16}#{accompany}#{config}#{pitch_shift}#{f0_scale}#{semi_tone_shift}#{length_adjust}#{inference_cfg_rate}#{output}#{skip_check}#{vocoder_dtype}#{vocoder_chunk}#{vocoder_overlap}'
+    arguments:
+      - key: source
+        name: 源人声音频
+        desc: 待转换的演唱音频（wav/flac/mp3 等）
+        dtype: file
+        method: select
+        required: true
+        template: ' --source "#{}"'
+
+      - key: target
+        name: 音色参考音频
+        desc: 提供目标音色的参考音频；可多段，按顺序拼接后截断至 25 s
+        dtype: file
+        method: select
+        multiple: true
+        required: true
+        template: ' --target #{"#{}"}{ }'
+
+      - key: pitch_shift
+        name: 变调（半音）
+        desc: 作用于最终 PC-NSF-HiFiGAN 显式 F0 条件，如 2.0 即升 2 个半音
+        dtype: number
+        method: slide
+        min: -12
+        max: 12
+        step: 1
+        value: 0
+        template: ' --pitch-shift #{}'
+
+      - key: diffusion_steps
+        name: 扩散步数
+        desc: DiT flow-matching 采样步数
+        dtype: number
+        value: 30
+        template: ' --diffusion-steps #{}'
+
+      - key: output
+        name: 输出目录
+        desc: 结果 FLAC 的写入目录；留空则直接写到源音频所在目录
+        dtype: directory
+        method: select
+        template: ' --output #{}'
+
+      - key: checkpoint
+        name: SVC 检查点
+        desc: YingMusic-SVC 模型权重文件
+        dtype: file
+        method: select
+        value: './checkpoints/YingMusic-SVC-full.pt'
+        template: ' --checkpoint "#{}"'
+
+      - key: config
+        name: 模型配置
+        desc: SVC 模型的 yaml 配置文件
+        dtype: file
+        method: select
+        value: './configs/YingMusic-SVC.yml'
+        template: ' --config "#{}"'
+
+      - key: cuda
+        name: CUDA 设备
+        desc: GPU 序号，如 0 或 1（对应 cuda:N）
+        dtype: string
+        value: '0'
+        template: ' --cuda #{}'
+
+      - key: fp16
+        name: FP16 推理
+        desc: DiT 主干是否以 fp16 autocast 加速（声码器精度由“声码器精度”单独控制）
+        dtype: boolean
+        value: true
+        template: ' --fp16 #{}'
+
+      - key: accompany
+        name: 伴奏音频
+        desc: 可选；提供后对结果做回声+混响 remix，产物写入输出目录的 accompany/ 子目录
+        dtype: file
+        method: select
+        template: ' --accompany #{}'
+
+      - key: f0_scale
+        name: F0 缩放倍率
+        desc: 显式 F0 的直接乘法缩放，1.2 ≈ 升 3.2 半音、0.8 ≈ 降 3.9 半音；叠加在变调之上
+        dtype: number
+        value: 1.0
+        template: ' --f0-scale #{}'
+
+      - key: semi_tone_shift
+        name: 强制半音移位
+        desc: SVC 内部自适应 F0 对齐的强制半音数；留空保持自动连读变调
+        dtype: number
+        template: ' --semi-tone-shift #{}'
+
+      - key: length_adjust
+        name: 时长调节
+        desc: 输出时长相对源音频的倍率
+        dtype: number
+        value: 1.0
+        template: ' --length-adjust #{}'
+
+      - key: inference_cfg_rate
+        name: CFG 引导强度
+        desc: classifier-free guidance 系数
+        dtype: number
+        value: 0.7
+        template: ' --inference-cfg-rate #{}'
+
+      - key: skip_check
+        name: 跳过预检
+        desc: 跳过运行前的依赖与模型权重自检
+        dtype: boolean
+        value: false
+        template: ' --skip-check'
+
+      - key: vocoder_dtype
+        name: 声码器精度
+        desc: 两个声码器的计算精度；bf16/fp16 显存约减半（权重仍为 fp32），如听到伪影可退回 fp32
+        dtype: string
+        method: select
+        options: [fp32, bf16, fp16]
+        value: bf16
+        template: ' --vocoder-dtype #{}'
+
+      - key: vocoder_chunk
+        name: 声码器分块帧数
+        desc: 分块推理的 mel 帧数（hop512@44.1kHz 下每帧约 11.6ms）；<=0 表示整段不分块
+        dtype: number
+        value: 2048
+        template: ' --vocoder-chunk #{}'
+
+      - key: vocoder_overlap
+        name: 分块重叠帧数
+        desc: 相邻分块重叠的 mel 帧数（波形交叉淡化拼接区），需大于模型感受野
+        dtype: number
+        value: 64
+        template: ' --vocoder-overlap #{}'

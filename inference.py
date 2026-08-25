@@ -10,17 +10,16 @@ YingMusic-SVC inference -- swapped two-stage vocoder pipeline (training-free):
 The original BigGAN-family (bigvgan) vocoding path has been removed; the
 predicted Mel is no longer fed to the built-in vocoder directly.
 
-最终输出为 FLAC，文件名自动附带元数据后缀（项目名、ckpt、变调等 CLI
-参数信息），由 gen_output_suffix() 生成。
+最终输出为 FLAC，文件名自动附带元数据后缀（项目名、ckpt、变调等 CLI参数信息），由 gen_output_suffix() 生成。
 
 Quick start refs:
 https://zread.ai/GiantAILab/YingMusic-SVC/2-quick-start
 https://zread.ai/GiantAILab/YingMusic-SVC/3-model-download-and-setup
 
 uv venv --python=3.10
-./.venv/Scripts/python.exe -c 'from modelscope import snapshot_download; snapshot_download('giantailab/YingMusic-SVC', local_dir='./checkpoints')'
 uv pip install torch~=2.4.0 torchaudio~=2.4.0 --index-url https://download.pytorch.org/whl/cu124
 uv pip install -r ./requirements.txt
+./.venv/Scripts/python.exe -c 'from modelscope import snapshot_download; snapshot_download('giantailab/YingMusic-SVC', local_dir='./checkpoints')'
 
 ./.venv/Scripts/python.exe inference.py --source vocal.wav --target timbre.wav
 ./.venv/Scripts/python.exe inference.py --source vocal.wav --target timbre1.wav timbre2.wav  # 多段参考拼接
