@@ -69,8 +69,8 @@ from hf_utils import load_custom_model_from_hf
 from mm4 import preprocess_voice_conversion
 from modules.audio import mel_spectrogram
 from modules.commons import *
-from pc_nsf_hifigan import load_pc_nsf_hifigan
-from pupu_vocoder import load_pupu_vocoder
+from modules.pc_nsf_hifigan import load_pc_nsf_hifigan
+from modules.pupu_vocoder import load_pupu_vocoder
 from Remix.auger import echo_then_reverb_save
 
 # ---------------------------------------------------------------------------

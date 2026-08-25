@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-PUPO_ROOT = Path(__file__).resolve().parent / "pretrain" / "vocoder" / "Pupu-Vocoder"
+PUPO_ROOT = Path(__file__).resolve().parent.parent / "pretrain" / "vocoder" / "Pupu-Vocoder"
 PUPO_CKPT_DIR = (
     PUPO_ROOT / "experiments" / "pupuvocoder" / "checkpoint"
     / "epoch-0051_step-2553605_loss-62.135194"
